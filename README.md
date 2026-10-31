@@ -46,7 +46,7 @@ The same selected health scenario and validation checkpoint-selection metric are
 
 The evaluator reports metrics at K=5, 10, and 20: Safety@K, SafetyAmongReturned, FillRate@K, P-DCG/P-NDCG, NDCG, Precision, Recall, safety-conditioned Precision/Recall, Unsafe@1, Unknown@K, recommendation coverage, and sample counts. Recall is undefined when its relevant-item pool is empty. Safety@K is only reported for a full K-item list; short lists report SafetyAmongReturned and FillRate@K.
 
-P-NDCG uses gain `2^relevance - 1` for SAFE recipes and `2^(-P) - 1` for non-SAFE recipes. `P` is the nominal penalty; `2^(-P)-1` is the actual negative gain. The ideal DCG uses SAFE relevant recipes from the same candidate set. A zero ideal DCG produces undefined P-NDCG, and negative scores are not clipped.
+P-NDCG uses gain `2^relevance - 1` for SAFE recipes and `2^(-P) - 1` for non-SAFE recipes. `P` is the nominal penalty; `2^(-P)-1` is the actual negative gain. The evaluator reports P-NDCG for `P = 1, 3, 4, 5, 10`; charts and example comparisons use `P = 4`. The ideal DCG uses SAFE relevant recipes from the same candidate set. A zero ideal DCG produces undefined P-NDCG, and negative scores are not clipped. Changing `P` only changes evaluation, so existing checkpoints can be reused without retraining.
 
 The validation split has item IDs but no star ratings, so checkpoint selection uses binary safe-conditioned NDCG@10. Test metrics use the held-out 4/5-star ratings. Unobserved recipes used for negative sampling are training-time negatives, not confirmed dislikes.
 

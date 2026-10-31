@@ -19,6 +19,9 @@ ROOT_DEFAULT = HERE
 # The 2026-10-31 Colab run stored this pre-evaluation-fix source hash. That
 # revision differs only in the nested relevance lookup fixed below.
 LEGACY_EVALUATION_FIX_SOURCE_HASH = "b2d9e17270d6dbfc8ebdc4a16a938a34c0d216916c706c2208246efdba1fd411"
+# Checkpoints trained by the immediately preceding Git revision can be reused
+# after this evaluation-only P sweep change.
+PRE_P4_EVALUATION_SOURCE_HASH = "9527ec7dbf3c14962fa663e13d7506cbb9ecf8f077cfd1a26ba66e9d8ceb3881"
 sys.path.insert(0, str(ROOT_DEFAULT / "latest version LightGCN_PathSim"))
 from dataloader import Dataset, read_split
 from transe_model import TransERecommender, transe_margin_loss
@@ -446,7 +449,10 @@ def evaluate(args):
     # must still match exactly.
     if changed_hashes and not (
             changed_hashes == ["experiment.py"] and
-            expected_hashes.get("experiment.py") == LEGACY_EVALUATION_FIX_SOURCE_HASH):
+            expected_hashes.get("experiment.py") in {
+                LEGACY_EVALUATION_FIX_SOURCE_HASH,
+                PRE_P4_EVALUATION_SOURCE_HASH,
+            }):
         raise ValueError("Evaluation data/code hashes differ from training.")
     if manifest.get("health_condition") != conditions:
         raise ValueError("Evaluation health condition differs from training. Use the same --health-condition.")
@@ -507,7 +513,7 @@ def evaluate(args):
                 base = safe_ndcg(recs, relevance.get(user, {}), user_status, candidates, k, 5, reference)
                 rec_rel = [float(relevance.get(user, {}).get(i, 0.0)) for i in recs]
                 safe_flags = [user_status.get(i, SafetyStatus.UNKNOWN) == SafetyStatus.SAFE for i in recs]
-                for penalty in (1, 3, 5, 10):
+                for penalty in (1, 3, 4, 5, 10):
                     metrics = dict(base)
                     metrics["P-DCG@K"] = dcg(rec_rel, k, safe_flags, penalty)
                     metrics["P-NDCG@K"] = (metrics["P-DCG@K"] / base["P_IDCG@K"]
@@ -563,9 +569,9 @@ def plot_metrics(table, folder):
         ("FillRate@K", "fill_rate_at_k.png")]
     for metric, filename in charts:
         fig, ax = plt.subplots(figsize=(8, 4.5))
-        for name, group in table[table.penalty_P == 5].groupby("system"):
+        for name, group in table[table.penalty_P == 4].groupby("system"):
             ax.plot(group.K, group[metric], marker="o", label=name)
-        ax.set(xlabel="K", ylabel=metric, title=f"{metric} by system (P=5)")
+        ax.set(xlabel="K", ylabel=metric, title=f"{metric} by system (P=4)")
         ax.legend()
         fig.tight_layout()
         fig.savefig(folder / filename, dpi=160)
@@ -574,7 +580,7 @@ def plot_metrics(table, folder):
 
 def comparison_examples(rows, folder):
     frame = pd.DataFrame(rows)
-    frame = frame[(frame.K == 10) & (frame.penalty_P == 5)]
+    frame = frame[(frame.K == 10) & (frame.penalty_P == 4)]
     frame.pivot(index="user_id", columns="system",
         values=["recommended", "Safety@K", "NDCG@K", "P-NDCG@K"]).to_csv(
             folder / "user_level_examples.csv")
