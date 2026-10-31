@@ -113,14 +113,14 @@ class KnownTripleSampler:
         raise RuntimeError("Could not sample corrupted TransE triples.")
 
 
-def load_inputs(root, profiles_path):
-    root, profiles_path = Path(root).resolve(), Path(profiles_path).resolve()
+def load_inputs(root):
+    root = Path(root).resolve()
     names = ["interactions/foodcom_train.csv", "interactions/foodcom_test.csv",
              "interactions/foodcom_train.txt", "interactions/foodcom_val.txt",
              "interactions/foodcom_test.txt", "recipes/foodcom_recipes_metadata.csv",
              "health/clinical_health_rules.json", "kg/foodcom_kg_triples.tsv"]
     paths = [root / name for name in names]
-    missing = [str(p) for p in paths + [profiles_path] if not p.is_file()]
+    missing = [str(p) for p in paths if not p.is_file()]
     if missing:
         raise FileNotFoundError("Missing inputs:\n" + "\n".join(missing))
     metadata = pd.read_csv(paths[5])
@@ -135,13 +135,6 @@ def load_inputs(root, profiles_path):
     if set(metadata.item_id) != set(range(n_items)):
         raise ValueError("item_id must be contiguous from zero.")
     rules = json.loads(paths[6].read_text(encoding="utf-8-sig"))
-    prof_frame = pd.read_csv(profiles_path, dtype={"user_id": int})
-    if not {"user_id", "conditions"}.issubset(prof_frame.columns):
-        raise ValueError("Profile file must have user_id,conditions columns.")
-    if prof_frame.user_id.duplicated().any():
-        raise ValueError("Each user_id must have exactly one profile row.")
-    profiles = {int(row.user_id): parse_profile_conditions(row.conditions)
-                for row in prof_frame.itertuples()}
     train_frame, test_frame = pd.read_csv(paths[0]), pd.read_csv(paths[1])
     for label, frame in (("train", train_frame), ("test", test_frame)):
         if not {"user_id", "item_id", "rating"}.issubset(frame.columns):
@@ -154,8 +147,6 @@ def load_inputs(root, profiles_path):
         if not frame.rating.isin([4.0, 5.0]).all():
             raise ValueError(f"{label} split contains ratings outside the frozen 4/5-star preference labels.")
     n_users = max(int(train_frame.user_id.max()), int(test_frame.user_id.max())) + 1
-    if ((prof_frame.user_id < 0) | (prof_frame.user_id >= n_users)).any():
-        raise ValueError("Profile user_id outside the frozen interaction index.")
     train, val, test = (read_split(p, n_items, n_users) for p in paths[2:5])
     pairs = lambda frame: {(int(u), int(i)) for u, i in zip(frame.user_id, frame.item_id)}
     split_pairs = lambda split: {(u, i) for u, items in split.items() for i in items}
@@ -166,17 +157,27 @@ def load_inputs(root, profiles_path):
         if any(set(items).intersection(second.get(u, [])) for u, items in first.items()):
             raise ValueError(f"Leakage found between {label} splits.")
     kg = load_kg(paths[7], n_users, n_items, train, val, test)
-    return (root, profiles_path, metadata, rules, profiles, train_frame, test_frame,
-            train, val, test, paths, kg)
+    return (root, metadata, rules, train_frame, test_frame, train, val, test, paths, kg)
 
 
-def build_safety_index(metadata, rules, profiles, n_users):
-    """One safety vector per distinct diagnosis profile, not per user."""
+def make_health_scenario(health_condition, rules, n_users):
+    """Apply one selected health-condition scenario to every user in this run."""
+    conditions = parse_profile_conditions(health_condition)
+    if not conditions:
+        raise ValueError("Choose a disease for this run, e.g. hypertension or diabetes; 'none' is not a disease scenario.")
+    missing = [condition for condition in conditions if condition not in rules.get("diseases", {})]
+    if missing:
+        raise ValueError("No configured health rule for: " + ", ".join(missing))
+    return conditions, {user: conditions for user in range(n_users)}
+
+
+def build_safety_index(metadata, rules, user_conditions, n_users):
+    """Build item safety labels for the selected run-wide health scenario."""
     columns = ["calories", "fat_pdv", "sugar_pdv", "sodium_pdv", "protein_pdv"]
     nutrition = metadata.set_index("item_id")[columns].to_dict("records")
     vectors, user_keys = {}, {}
     for user in range(n_users):
-        conditions = profiles.get(user)
+        conditions = user_conditions.get(user)
         key = None if conditions is None else tuple(conditions)
         user_keys[user] = key
         if key not in vectors:
@@ -226,19 +227,17 @@ def score_user_batch(model, user_ids, item_chunk_size=1024):
     return model.score_all(user_ids, item_chunk_size=item_chunk_size)
 
 
-def validation_score(model, dataset, val, raw_train, user_keys, vectors, profiles, k=10):
-    """Binary safe-conditioned validation NDCG; validation text has no star ratings."""
+def validation_score(model, dataset, val, raw_train, user_keys, vectors, k=10):
+    """Binary safe-conditioned validation NDCG under the run-wide disease scenario."""
     active, relevant_by_user = [], {}
     for user, heldout in val.items():
-        if profiles.get(user) is None:
-            continue
         states = status_vector(user_keys, vectors, user)
         relevant = [item for item in heldout if states[item] == SafetyStatus.SAFE.value]
         if relevant:
             active.append(user)
             relevant_by_user[user] = set(relevant)
     if not active:
-        raise ValueError("Validation has no safe positive for known profiles; cannot select checkpoint.")
+        raise ValueError("Validation has no SAFE positive under this health scenario; cannot select checkpoint.")
     model.eval()
     values_by_user = []
     with torch.no_grad():
@@ -269,38 +268,38 @@ def validation_score(model, dataset, val, raw_train, user_keys, vectors, profile
         raise ValueError("No eligible validation candidates remain for checkpoint selection.")
     return float(np.mean(values_by_user))
 
-def input_hashes(root, profile_path, paths):
+
+def input_hashes(root, paths):
     sources = [root / "latest version LightGCN_PathSim/dataloader.py",
                HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py"]
     return {str(p.relative_to(root)) if p.is_relative_to(root) else str(p): digest(p)
-            for p in paths + [profile_path] + sources}
+            for p in paths + sources}
 
 def train(args):
-    (root, profile_path, metadata, rules, profiles, _, _, raw_train, val, _,
-     paths, kg) = load_inputs(args.root, args.profiles)
+    (root, metadata, rules, _, _, raw_train, val, _, paths, kg) = load_inputs(args.root)
     n_users = max(raw_train) + 1
-    user_keys, vectors = build_safety_index(metadata, rules, profiles, n_users)
-    known_profiles = sum(profiles.get(u) is not None for u in range(n_users))
-    if not known_profiles:
-        raise ValueError("No known profiles. Blank is UNKNOWN; enter none only for explicitly no disease.")
+    conditions, user_conditions = make_health_scenario(args.health_condition, rules, n_users)
+    user_keys, vectors = build_safety_index(metadata, rules, user_conditions, n_users)
+    checkpoint_selector = "validation safe-conditioned NDCG@10"
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(val)
     safe_positive, unsafe, safety_users = training_safety_pools(
         dataset, user_keys, vectors, raw_train)
     if args.model == "m2" and not len(safety_users):
-        raise ValueError("M2 needs profiled users with safe train positives and unsafe candidates.")
+        raise ValueError("M2 needs safe training interactions and unsafe recipe candidates under this health scenario.")
     seed_all(args.seed)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest = {"architecture": "TransE", "training_objective": "margin_ranking",
+                "health_condition": conditions,
                 "distance": args.distance, "margin": args.margin,
                 "embedding": args.embedding, "entity_count": len(kg["entity2id"]),
                 "relation_count": len(kg["relation2id"]),
                 "seed": args.seed, "epochs": args.epochs, "patience": args.patience,
                 "batch_size": args.batch_size, "learning_rate": args.learning_rate,
-                "checkpoint_selector": "validation safe-conditioned NDCG@10",
-                "input_sha256": input_hashes(root, profile_path, paths)}
+                "checkpoint_selector": checkpoint_selector,
+                "input_sha256": input_hashes(root, paths)}
     manifest_path = run_dir / "experiment.json"
     if manifest_path.exists():
         if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
@@ -311,6 +310,7 @@ def train(args):
     out.mkdir(exist_ok=False)
     model_config = {"model": args.model, "architecture": "TransE",
                     "training_objective": "TransE margin ranking loss",
+                    "health_condition": conditions,
                     "distance": args.distance, "margin": args.margin,
                     "lambda_safe": args.lambda_safe if args.model == "m2" else 0.,
                     "delta": args.delta if args.model == "m2" else 0.}
@@ -369,10 +369,11 @@ def train(args):
                "safety_loss": sums["safety_loss"] / safety_count if safety_count else 0.0,
                "total_loss": sums["total_loss"] / count}
         row["validation_safe_ndcg_at_10"] = validation_score(
-            model, dataset, val, raw_train, user_keys, vectors, profiles)
+            model, dataset, val, raw_train, user_keys, vectors)
+        selection_score = row["validation_safe_ndcg_at_10"]
         history.append(row)
-        if row["validation_safe_ndcg_at_10"] > best:
-            best, best_epoch, stale = row["validation_safe_ndcg_at_10"], epoch, 0
+        if selection_score > best:
+            best, best_epoch, stale = selection_score, epoch, 0
             torch.save({"state_dict": model.state_dict(), "epoch": epoch,
                         "validation_score": best, "manifest": manifest, "model_config": model_config},
                        out / "best_checkpoint.pt")
@@ -384,8 +385,11 @@ def train(args):
     pd.DataFrame(history).to_csv(out / "training_history.csv", index=False)
     plot_loss(history, out / "loss_curves.png")
     (out / "training_summary.json").write_text(json.dumps({
-        "best_epoch": best_epoch, "best_validation_safe_ndcg_at_10": best,
-        "epochs_completed": len(history), "known_profile_users": known_profiles,
+        "best_epoch": best_epoch, "best_validation_score": best,
+        "checkpoint_selection_metric": manifest["checkpoint_selector"],
+        "best_validation_safe_ndcg_at_10": best,
+        "epochs_completed": len(history), "health_condition": conditions,
+        "scenario_users": n_users,
         "kg_triples": int(len(kg["triples"])),
         "training_users_with_safety_pairs": int(len(safety_users)), "device": str(device),
         "architecture": "TransE", "training_objective": "margin_ranking"}, indent=2),
@@ -421,17 +425,19 @@ def score_model(model, dataset):
     return torch.cat(chunks).numpy()
 
 def evaluate(args):
-    (root, profile_path, metadata, rules, profiles, _, test_frame, raw_train, val, test,
-     paths, kg) = load_inputs(args.root, args.profiles)
+    (root, metadata, rules, _, test_frame, raw_train, val, test, paths, kg) = load_inputs(args.root)
     n_users = max(raw_train) + 1
-    user_keys, vectors = build_safety_index(metadata, rules, profiles, n_users)
+    conditions, user_conditions = make_health_scenario(args.health_condition, rules, n_users)
+    user_keys, vectors = build_safety_index(metadata, rules, user_conditions, n_users)
     run_dir = Path(args.run_dir).resolve()
     manifest_path = run_dir / "experiment.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Missing experiment manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest["input_sha256"] != input_hashes(root, profile_path, paths):
-        raise ValueError("Evaluation data/profile/code hashes differ from training.")
+    if manifest["input_sha256"] != input_hashes(root, paths):
+        raise ValueError("Evaluation data/code hashes differ from training.")
+    if manifest.get("health_condition") != conditions:
+        raise ValueError("Evaluation health condition differs from training. Use the same --health-condition.")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(test)
@@ -458,7 +464,7 @@ def evaluate(args):
         lookup = StatusLookup(states)
         reference = prepare_metric_reference(relevance.get(user, {}), lookup, candidates)
         contexts[user] = (states, candidates, lookup, reference)
-    example_users = set(sorted(u for u in profiles if profiles[u] is not None)[:200])
+    example_users = set(range(min(n_users, 200)))
     examples, rows, score_cache = [], [], {}
     for label, model_name, hard_filter in arms:
         if model_name not in score_cache:
@@ -494,7 +500,8 @@ def evaluate(args):
                     metrics["P-DCG@K"] = dcg(rec_rel, k, safe_flags, penalty)
                     metrics["P-NDCG@K"] = (metrics["P-DCG@K"] / base["P_IDCG@K"]
                         if base["P_IDCG@K"] > 0 else None)
-                    rows.append({"system": label, "model": model_name, "hard_filter": hard_filter,
+                    rows.append({"health_condition": "|".join(conditions),
+                        "system": label, "model": model_name, "hard_filter": hard_filter,
                         "user_id": user, "K": k, "penalty_P": penalty, "catalog_size": dataset.m_items,
                         "coverage_status": ("FULL_TOP_K" if len(recs) == k else
                             ("INSUFFICIENT_SAFE_CANDIDATES" if hard_filter else "INSUFFICIENT_CANDIDATES")),
@@ -515,7 +522,7 @@ def aggregate_rows(rows):
     metrics = ["Safety@K", "SafetyAmongReturned", "FillRate@K", "P-DCG@K", "P-NDCG@K",
         "NDCG@K", "Precision@K", "Recall@K", "EligiblePrecision@K", "EligibleRecall@K",
         "Unsafe@1", "Unknown@K", "RecommendationCount"]
-    group_cols = ["system", "model", "hard_filter", "K", "penalty_P"]
+    group_cols = ["health_condition", "system", "model", "hard_filter", "K", "penalty_P"]
     output = []
     for key, part in frame.groupby(group_cols, dropna=False, sort=False):
         record = dict(zip(group_cols, key))
@@ -586,7 +593,8 @@ def main():
     subs = parser.add_subparsers(dest="command", required=True)
     def shared(p):
         p.add_argument("--root", default=str(ROOT_DEFAULT))
-        p.add_argument("--profiles", required=True)
+        p.add_argument("--health-condition", required=True,
+                       help="One condition or a '|' separated combination; e.g. hypertension or diabetes|hypertension or comorbidity")
         p.add_argument("--seed", type=int, default=2020)
         p.add_argument("--embedding", type=int, default=64)
         p.add_argument("--distance", choices=("l1", "l2"), default="l1")
@@ -604,7 +612,8 @@ def main():
     tr.add_argument("--delta", type=float, default=1.0)
     ev = subs.add_parser("evaluate")
     ev.add_argument("--root", default=str(ROOT_DEFAULT))
-    ev.add_argument("--profiles", required=True)
+    ev.add_argument("--health-condition", required=True,
+                    help="Must match the condition used for training")
     ev.add_argument("--run-dir", required=True)
     ev.add_argument("--device", default=None)
     sw = subs.add_parser("sweep")

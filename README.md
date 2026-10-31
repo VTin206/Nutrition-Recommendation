@@ -1,92 +1,104 @@
 # Food.com TransE Safety Recommendation Experiment
 
-This folder is self-contained for Google Colab. It includes the frozen Food.com train/validation/test splits, the training knowledge graph, recipe nutrition metadata, configurable health rules, and the TransE training/evaluation code. User diagnosis profiles remain user-supplied because the dataset has no patient-level condition labels.
+This folder is intended to be uploaded to Google Drive and run in Colab. It contains the fixed Food.com interaction splits, training knowledge graph, recipe nutrition metadata, configurable health rules, and TransE training/evaluation code. The dataset has no patient diagnosis labels.
 
-## Data and limits
+## Health-condition setup
 
-- `kg/foodcom_kg_triples.tsv` contains the training KG: user–recipe interactions plus recipe-side relations. Its `INTERACTED` triples match the frozen training split exactly; validation and test interactions are kept out of the KG.
-- The interaction CSVs contain the preference labels used for final evaluation. The KG includes only training interactions.
-- `profiles_template.csv` is a template, not real diagnosis data. Blank conditions mean UNKNOWN; enter `none` only for a verified no-disease profile.
-- Nutritional thresholds are configurable research assumptions, not independently clinically validated rules. Missing nutrition values are UNKNOWN.
-- The older LightGCN source folder is retained because its data loader reads the frozen interaction splits. This experiment trains **TransE only**.
+Choose one health condition for each experiment run. The code applies that same condition scenario to every user in that run. This recreates the older experiment setup without asking you to create a `profiles.csv` file.
 
-## TransE training objectives
+Examples:
 
-The score of a triple is the negative translation distance:
+- `hypertension`
+- `diabetes`
+- `heart_failure`
+- `fatty_liver`
+- `kidney_failure`
+- `comorbidity` for all five conditions together
+- `diabetes|hypertension` for a selected combination
+
+This is a run-wide research assumption, not a claim that Food.com users actually have that diagnosis. The configured nutrition rules are research assumptions and are not patient-specific medical advice. Missing nutrition values are marked UNKNOWN; the safety filter excludes both UNSAFE and UNKNOWN recipes.
+
+The old per-user profile template is no longer needed and has been removed. You can train and evaluate without uploading any additional profile file.
+
+## Data and model
+
+- `kg/foodcom_kg_triples.tsv` contains user–recipe training interactions and recipe-side relations. Its `INTERACTED` triples match the frozen training split; validation and test interactions are excluded.
+- The CSV interaction files provide preference labels for final test evaluation. Rating 4 maps to relevance 1 and rating 5 maps to relevance 2.
+- This experiment trains **TransE only**. The bundled LightGCN files are retained for the shared data loader.
+
+The triple score is the negative translation distance:
 
 `s(h,r,t) = -||e_h + e_r - e_t||_1`
 
-The implementation initializes embeddings using the TransE paper's range, normalizes entity vectors to unit L2 norm before each update, and uses SGD with one uniformly corrupted head or tail per positive KG triple. Corrupted triples already present in the training KG are rejected. The held-out validation/test triples are not consulted by the negative sampler.
+Entity embeddings are normalized to unit L2 length before each update. Training uses SGD, one uniformly corrupted head or tail per positive KG triple, rejects negatives already in the training KG, and uses TransE's margin-ranking objective.
 
-**M1 — TransE baseline** uses only the mean margin-ranking objective:
+**M1 — TransE baseline** uses only the TransE margin loss:
 
-`L_TransE = mean(max(0, margin + d_positive - d_negative))`
+`L_M1 = mean(max(0, margin + d_positive - d_negative))`
 
-It does not use BPR or a safety loss. This is TransE's KG-triple training objective, rather than a recommender-specific BPR objective. For Top-K recommendation, the trained model scores `(User, INTERACTED, Recipe)` triples and ranks recipes by score.
+**M2 — Safety-aware TransE** adds a safety ranking loss:
 
-**M2 — Safety-aware TransE** adds the separately configurable safety ranking term:
+`L_M2 = L_TransE + lambda_safe * mean(max(0, delta + s_unsafe - s_safe))`
 
-`L_total = L_TransE + lambda_safe * mean(max(0, delta + s_unsafe - s_safe))`
-
-The safety term uses configured profile/rule labels. UNKNOWN is not silently treated as SAFE. M2 is a safety-aware extension, not the original TransE objective.
-
-The training split, KG, initialization seed, and TransE margin objective are shared by M1 and M2. Validation safe-conditioned NDCG@10 selects the checkpoint; test data is not used for checkpoint selection. At evaluation, M1 ranks without a safety filter. M2 applies a deterministic hard filter after training: only SAFE recipes are returned, in their TransE score order. UNSAFE and UNKNOWN recipes are excluded, and short lists are not backfilled.
+The same selected health scenario and validation checkpoint-selection metric are used for M1 and M2. M1 has no safety term in its training loss. M2 learns from SAFE/UNSAFE recipe pairs. At final evaluation M1 ranks without filtering; M2 removes UNSAFE and UNKNOWN recipes after scoring and returns fewer than K if there are not enough SAFE recipes.
 
 ## Evaluation
 
-At K=5, 10, and 20, the evaluator reports preference NDCG/Precision/Recall, safety-conditioned Precision/Recall, Safety@K, SafetyAmongReturned, FillRate@K, Unsafe@1, Unknown@K, recommendation coverage, P-DCG/P-NDCG, and sample counts. Recall is undefined when the relevant pool is empty. Safety@K is reported only for lists with exactly K returned recipes; shorter lists report SafetyAmongReturned and FillRate@K.
+The evaluator reports metrics at K=5, 10, and 20: Safety@K, SafetyAmongReturned, FillRate@K, P-DCG/P-NDCG, NDCG, Precision, Recall, safety-conditioned Precision/Recall, Unsafe@1, Unknown@K, recommendation coverage, and sample counts. Recall is undefined when its relevant-item pool is empty. Safety@K is only reported for a full K-item list; short lists report SafetyAmongReturned and FillRate@K.
 
-P-NDCG uses gain `2^relevance - 1` for SAFE recipes and `2^(-P) - 1` for non-SAFE recipes. P is the nominal penalty, while `2^(-P)-1` is the actual negative gain. Eligible IDCG uses SAFE relevant recipes from the same candidate universe. A zero IDCG produces undefined P-NDCG; negative scores are not clipped.
+P-NDCG uses gain `2^relevance - 1` for SAFE recipes and `2^(-P) - 1` for non-SAFE recipes. `P` is the nominal penalty; `2^(-P)-1` is the actual negative gain. The ideal DCG uses SAFE relevant recipes from the same candidate set. A zero ideal DCG produces undefined P-NDCG, and negative scores are not clipped.
 
-The validation split contains item IDs but no star ratings, so checkpoint selection uses binary safe-conditioned NDCG. Test metrics use graded relevance: rating 4 maps to 1 and rating 5 maps to 2. Unobserved recipes used in negative sampling are training-time negative samples, not confirmed dislikes.
+The validation split has item IDs but no star ratings, so checkpoint selection uses binary safe-conditioned NDCG@10. Test metrics use the held-out 4/5-star ratings. Unobserved recipes used for negative sampling are training-time negatives, not confirmed dislikes.
 
 ## Run in Colab
 
-Upload this entire folder to Drive, mount Drive, and set its path:
+Upload this entire folder to Drive, mount Drive, and set the folder and selected health scenario:
 
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
 ROOT = '/content/drive/MyDrive/safety_aware_food_recommendation'
-PROFILES = ROOT + '/profiles.csv'
-RUN = ROOT + '/runs/transe_margin'
+HEALTH_CONDITION = 'hypertension'
+RUN = ROOT + '/runs/transe_hypertension'
 ```
 
-Install the package requirements if the Colab runtime does not already provide them:
+Install the listed requirements:
 
 ```bash
 !pip install -q -r "$ROOT/requirements.txt"
 ```
 
-Copy `profiles_template.csv` to `profiles.csv` and enter the profiles you actually have. Train the pure TransE baseline and the safety-aware TransE variant separately:
+Train M1 and M2 separately with the same `HEALTH_CONDITION` and `RUN` path:
 
 ```bash
-!python "$ROOT/experiment.py" train --root "$ROOT" --profiles "$PROFILES" --run-dir "$RUN" --model m1 --embedding 64 --distance l1 --margin 1.0 --epochs 300 --patience 20 --seed 2020
-!python "$ROOT/experiment.py" train --root "$ROOT" --profiles "$PROFILES" --run-dir "$RUN" --model m2 --embedding 64 --distance l1 --margin 1.0 --lambda-safe 0.5 --delta 1.0 --epochs 300 --patience 20 --seed 2020
+!python "$ROOT/experiment.py" train --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN" --model m1 --embedding 64 --distance l1 --margin 1.0 --epochs 300 --patience 20 --seed 2020
+!python "$ROOT/experiment.py" train --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN" --model m2 --embedding 64 --distance l1 --margin 1.0 --lambda-safe 0.5 --delta 1.0 --epochs 300 --patience 20 --seed 2020
 ```
 
-Evaluate both trained variants in a separate step:
+Then evaluate both models:
 
 ```bash
-!python "$ROOT/experiment.py" evaluate --root "$ROOT" --profiles "$PROFILES" --run-dir "$RUN"
+!python "$ROOT/experiment.py" evaluate --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN"
 ```
 
-The evaluation compares exactly M1 and M2. Train both checkpoints before evaluating to get the direct comparison; if only one checkpoint exists, only that method is reported.
+The condition used for evaluation must match the condition used in training. For another disease, change both `HEALTH_CONDITION` and `RUN` (for example `diabetes` and `runs/transe_diabetes`) and train both models again. This keeps different condition scenarios in separate result folders.
 
-Run the validation-only safety hyperparameter sweep with:
+Optional M2 validation sweep:
 
 ```bash
-!python "$ROOT/experiment.py" sweep --root "$ROOT" --profiles "$PROFILES" --output-dir "$ROOT/runs/sweep" --embedding 64 --distance l1 --margin 1.0 --epochs 300 --patience 20 --seed 2020
+!python "$ROOT/experiment.py" sweep --root "$ROOT" --health-condition "$HEALTH_CONDITION" --output-dir "$ROOT/runs/sweep_hypertension" --embedding 64 --distance l1 --margin 1.0 --epochs 300 --patience 20 --seed 2020
 ```
 
-Use a new run directory for retraining with changed data or settings. The manifest hashes the inputs and relevant source files and rejects mismatched evaluation inputs.
+Each run manifest records the selected health condition and hashes the inputs and source code. Use a fresh run folder after changing data or settings.
 
 ## Outputs
 
-Each trained variant saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. Evaluation saves per-user and aggregate metric tables, user-level recommendation examples, baseline unsafe examples, and charts for Safety@K, P-NDCG@K, NDCG@K, Recall@K, and FillRate@K.
+Each model folder saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. Evaluation saves per-user and aggregate metric tables, recommendation examples, and charts for Safety@K, P-NDCG@K, NDCG@K, Recall@K, and FillRate@K.
 
 ## Tests
 
+Run the bundled unit tests with:
+
 ```bash
-python -B -m unittest discover -s "$ROOT/tests" -v
+python -B -m unittest discover -s tests -v
 ```

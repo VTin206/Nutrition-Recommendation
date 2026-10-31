@@ -16,6 +16,7 @@ ALIASES = {
     "fatty_liver": "steatohepatitis", "fatty_liver_disease": "steatohepatitis", "mash": "steatohepatitis",
     "nash": "steatohepatitis", "steatohepatitis": "steatohepatitis",
     "heart_failure": "heart_failure", "kidney_failure": "kidney_failure",
+    "comorbidity": "comorbidity", "all_five": "comorbidity", "all_diseases": "comorbidity",
     "chronic_kidney_disease": "kidney_failure", "chronic_kidney_failure": "kidney_failure", "renal_failure": "kidney_failure", "ckd": "kidney_failure",
 }
 
