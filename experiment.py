@@ -493,7 +493,7 @@ def evaluate(args):
             for k in (5, 10, 20):
                 recs = ranked[:k]
                 base = safe_ndcg(recs, relevance.get(user, {}), user_status, candidates, k, 5, reference)
-                rec_rel = [float(relevance.get(i, 0.0)) for i in recs]
+                rec_rel = [float(relevance.get(user, {}).get(i, 0.0)) for i in recs]
                 safe_flags = [user_status.get(i, SafetyStatus.UNKNOWN) == SafetyStatus.SAFE for i in recs]
                 for penalty in (1, 3, 5, 10):
                     metrics = dict(base)
