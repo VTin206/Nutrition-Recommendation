@@ -1,4 +1,4 @@
-"""M1/M2 safety-aware Food.com experiments with TransE or LightGCN scoring."""
+"""M1/M2 Food.com experiments using TransE margin training."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -18,8 +18,7 @@ HERE = Path(__file__).resolve().parent
 ROOT_DEFAULT = HERE
 sys.path.insert(0, str(ROOT_DEFAULT / "latest version LightGCN_PathSim"))
 from dataloader import Dataset, read_split
-from model import LightGCN
-from transe_model import TransERecommender
+from transe_model import TransERecommender, transe_margin_loss
 
 
 def seed_all(seed):
@@ -38,12 +37,88 @@ def digest(path):
     return h.hexdigest()
 
 
+def load_kg(path, n_users, n_items, train, val, test):
+    """Load the bundled training KG and verify its interaction split boundary."""
+    frame = pd.read_csv(path, sep="\t", usecols=["head", "relation", "tail"], dtype=str)
+    if frame.empty or frame.isna().any().any():
+        raise ValueError("KG triples must be non-empty and have no missing values.")
+    required_users = [f"User_{u}" for u in range(n_users)]
+    required_recipes = [f"Recipe_{i}" for i in range(n_items)]
+    entities = sorted(set(frame["head"]) | set(frame["tail"]) |
+                      set(required_users) | set(required_recipes))
+    relations = sorted(set(frame["relation"]))
+    entity2id = {name: idx for idx, name in enumerate(entities)}
+    relation2id = {name: idx for idx, name in enumerate(relations)}
+    if "INTERACTED" not in relation2id:
+        raise ValueError("KG is missing the INTERACTED relation.")
+    triples = np.column_stack((frame["head"].map(entity2id),
+                               frame["relation"].map(relation2id),
+                               frame["tail"].map(entity2id))).astype(np.int64)
+    expected_train = {(f"User_{u}", f"Recipe_{i}") for u, items in train.items() for i in items}
+    heldout = {(f"User_{u}", f"Recipe_{i}") for split in (val, test)
+               for u, items in split.items() for i in items}
+    interaction_rows = frame.loc[frame["relation"] == "INTERACTED"]
+    actual_interactions = set(zip(interaction_rows["head"], interaction_rows["tail"]))
+    missing = expected_train - actual_interactions
+    extra = actual_interactions - expected_train
+    leaked = heldout & actual_interactions
+    if missing:
+        raise ValueError(f"KG is missing {len(missing)} frozen training interactions.")
+    if leaked:
+        raise ValueError(f"KG contains {len(leaked)} validation/test interactions.")
+    if extra:
+        raise ValueError(f"KG contains {len(extra)} INTERACTED triples outside the frozen train split.")
+    return {
+        "triples": triples,
+        "entity2id": entity2id,
+        "relation2id": relation2id,
+        "user_entity_ids": np.asarray([entity2id[x] for x in required_users], dtype=np.int64),
+        "recipe_entity_ids": np.asarray([entity2id[x] for x in required_recipes], dtype=np.int64),
+        "interacted_relation_id": relation2id["INTERACTED"],
+    }
+
+
+class KnownTripleSampler:
+    """Uniformly corrupt one TransE triple while rejecting known KG facts."""
+
+    def __init__(self, triples, n_entities, n_relations, seed):
+        self.n_entities = int(n_entities)
+        self.n_relations = int(n_relations)
+        self.rng = np.random.default_rng(seed)
+        self.known_codes = np.unique(self._encode(triples[:, 0], triples[:, 1], triples[:, 2]))
+
+    def _encode(self, heads, relations, tails):
+        return (heads * self.n_relations + relations) * self.n_entities + tails
+
+    def sample(self, batch):
+        if not len(batch):
+            raise ValueError("Cannot sample negatives for an empty triple batch.")
+        negatives = batch.copy()
+        corrupt_head = self.rng.random(len(batch)) < 0.5
+        candidates = self.rng.integers(0, self.n_entities, size=len(batch), dtype=np.int64)
+        negatives[corrupt_head, 0] = candidates[corrupt_head]
+        negatives[~corrupt_head, 2] = candidates[~corrupt_head]
+        for _ in range(1000):
+            codes = self._encode(negatives[:, 0], negatives[:, 1], negatives[:, 2])
+            positions = np.searchsorted(self.known_codes, codes)
+            safe_positions = np.minimum(positions, len(self.known_codes) - 1)
+            invalid = ((positions < len(self.known_codes)) &
+                       (self.known_codes[safe_positions] == codes))
+            if not invalid.any():
+                return negatives
+            rows = np.flatnonzero(invalid)
+            replacements = self.rng.integers(0, self.n_entities, size=len(rows), dtype=np.int64)
+            negatives[rows[corrupt_head[rows]], 0] = replacements[corrupt_head[rows]]
+            negatives[rows[~corrupt_head[rows]], 2] = replacements[~corrupt_head[rows]]
+        raise RuntimeError("Could not sample corrupted TransE triples.")
+
+
 def load_inputs(root, profiles_path):
     root, profiles_path = Path(root).resolve(), Path(profiles_path).resolve()
     names = ["interactions/foodcom_train.csv", "interactions/foodcom_test.csv",
              "interactions/foodcom_train.txt", "interactions/foodcom_val.txt",
              "interactions/foodcom_test.txt", "recipes/foodcom_recipes_metadata.csv",
-             "health/clinical_health_rules.json"]
+             "health/clinical_health_rules.json", "kg/foodcom_kg_triples.tsv"]
     paths = [root / name for name in names]
     missing = [str(p) for p in paths + [profiles_path] if not p.is_file()]
     if missing:
@@ -90,7 +165,9 @@ def load_inputs(root, profiles_path):
                                  (train, test, "train/test"), (val, test, "validation/test")):
         if any(set(items).intersection(second.get(u, [])) for u, items in first.items()):
             raise ValueError(f"Leakage found between {label} splits.")
-    return root, profiles_path, metadata, rules, profiles, train_frame, test_frame, train, val, test, paths
+    kg = load_kg(paths[7], n_users, n_items, train, val, test)
+    return (root, profiles_path, metadata, rules, profiles, train_frame, test_frame,
+            train, val, test, paths, kg)
 
 
 def build_safety_index(metadata, rules, profiles, n_users):
@@ -115,70 +192,41 @@ def status_vector(user_keys, vectors, user):
     return np.full(len(next(iter(vectors.values()))), SafetyStatus.UNKNOWN.value, dtype=object)
 
 
-def apply_profile_safe_train_interactions(dataset, user_keys, vectors):
-    """Use identical profile-eligible train interactions for M1 and M2."""
-    filtered = []
-    for user, items in enumerate(dataset.allPos):
-        state = status_vector(user_keys, vectors, user)
-        filtered.append(items[state[items] == SafetyStatus.SAFE.value])
-    dataset.allPos = filtered
-    dataset.trainDataSize = sum(len(x) for x in filtered)
-    dataset._graph = None
-    if not dataset.trainDataSize:
-        raise ValueError("Safety profiles leave no profile-eligible train interactions for this backbone.")
-
-
-def build_model(dataset, seed, embedding, layers, backbone="transe", gamma=12.0):
-    seed_all(seed)
-    if backbone == "transe":
-        return TransERecommender(dataset.n_users, dataset.m_items, embedding, gamma)
-    if backbone == "lightgcn":
-        config = {"latent_dim_rec": embedding, "lightGCN_n_layers": layers,
-                  "keep_prob": 1.0, "A_split": False, "pretrain": 0, "dropout": 0}
-        return LightGCN(config, dataset)
-    raise ValueError(f"Unsupported backbone: {backbone}")
-
-
-def pair_scores(model, user_ids, item_ids, backbone, embeddings=None):
-    if backbone == "transe":
-        return model.score_pairs(user_ids, item_ids)
-    if embeddings is None:
-        embeddings = model.computer()
-    users_emb, items_emb = embeddings
-    return (users_emb[user_ids] * items_emb[item_ids]).sum(dim=1)
-
-
-def score_user_batch(model, user_ids, backbone, embeddings=None, item_chunk_size=1024):
-    if backbone == "transe":
-        return model.score_all(user_ids, item_chunk_size=item_chunk_size)
-    if embeddings is None:
-        embeddings = model.computer()
-    users_emb, items_emb = embeddings
-    return users_emb[user_ids] @ items_emb.T
-
-
-def training_pools(dataset, user_keys, vectors, raw_train):
-    """Use train positives and train-unobserved items only; never inspect val/test labels."""
-    positive, negative, unsafe, users = {}, {}, {}, []
+def training_safety_pools(dataset, user_keys, vectors, raw_train):
+    """Build safety pairs only from train positives and unobserved recipes."""
+    safe_positive, unsafe, safety_users = {}, {}, []
     catalog = np.arange(dataset.m_items, dtype=np.int64)
     for user, observed in enumerate(dataset.allPos):
         states = status_vector(user_keys, vectors, user)
-        safe = states == SafetyStatus.SAFE.value
         allowed = np.ones(dataset.m_items, dtype=bool)
         train_seen = raw_train.get(user, [])
         if len(train_seen):
             allowed[train_seen] = False
-        positive_items = observed[safe[observed]]
-        safe_unseen = catalog[safe & allowed]
+        safe_items = observed[states[observed] == SafetyStatus.SAFE.value]
         unsafe_items = catalog[(states == SafetyStatus.UNSAFE.value) & allowed]
-        if len(positive_items) and len(safe_unseen):
-            positive[user], negative[user], unsafe[user] = positive_items, safe_unseen, unsafe_items
-            users.append(user)
-    if not users:
-        raise ValueError("No profiled user has safe train positives and safe unobserved items.")
-    return positive, negative, unsafe, np.asarray(users, dtype=np.int64)
+        if len(safe_items) and len(unsafe_items):
+            safe_positive[user] = safe_items
+            unsafe[user] = unsafe_items
+            safety_users.append(user)
+    return safe_positive, unsafe, np.asarray(safety_users, dtype=np.int64)
 
-def validation_score(model, dataset, val, raw_train, user_keys, vectors, profiles, backbone, k=10):
+
+def build_model(kg, embedding, distance="l1"):
+    return TransERecommender(
+        len(kg["entity2id"]), len(kg["relation2id"]), embedding,
+        kg["user_entity_ids"], kg["recipe_entity_ids"],
+        kg["interacted_relation_id"], distance=distance)
+
+
+def pair_scores(model, user_ids, item_ids):
+    return model.score_pairs(user_ids, item_ids)
+
+
+def score_user_batch(model, user_ids, item_chunk_size=1024):
+    return model.score_all(user_ids, item_chunk_size=item_chunk_size)
+
+
+def validation_score(model, dataset, val, raw_train, user_keys, vectors, profiles, k=10):
     """Binary safe-conditioned validation NDCG; validation text has no star ratings."""
     active, relevant_by_user = [], {}
     for user, heldout in val.items():
@@ -194,11 +242,10 @@ def validation_score(model, dataset, val, raw_train, user_keys, vectors, profile
     model.eval()
     values_by_user = []
     with torch.no_grad():
-        embeddings = model.computer() if backbone == "lightgcn" else None
         for start in range(0, len(active), 64):
             user_batch = active[start:start + 64]
             ids = torch.as_tensor(user_batch, dtype=torch.long, device=dataset.device)
-            score_batch = score_user_batch(model, ids, backbone, embeddings).cpu().numpy()
+            score_batch = score_user_batch(model, ids).cpu().numpy()
             for row, user in enumerate(user_batch):
                 states = status_vector(user_keys, vectors, user)
                 seen = np.zeros(dataset.m_items, dtype=bool)
@@ -223,16 +270,14 @@ def validation_score(model, dataset, val, raw_train, user_keys, vectors, profile
     return float(np.mean(values_by_user))
 
 def input_hashes(root, profile_path, paths):
-    sources = [root / "latest version LightGCN_PathSim/model.py",
-               root / "latest version LightGCN_PathSim/dataloader.py",
-               root / "latest version LightGCN_PathSim/world.py",
+    sources = [root / "latest version LightGCN_PathSim/dataloader.py",
                HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py"]
     return {str(p.relative_to(root)) if p.is_relative_to(root) else str(p): digest(p)
             for p in paths + [profile_path] + sources}
 
 def train(args):
     (root, profile_path, metadata, rules, profiles, _, _, raw_train, val, _,
-     paths) = load_inputs(args.root, args.profiles)
+     paths, kg) = load_inputs(args.root, args.profiles)
     n_users = max(raw_train) + 1
     user_keys, vectors = build_safety_index(metadata, rules, profiles, n_users)
     known_profiles = sum(profiles.get(u) is not None for u in range(n_users))
@@ -241,13 +286,17 @@ def train(args):
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(val)
-    apply_profile_safe_train_interactions(dataset, user_keys, vectors)
-    positive, negative, unsafe, train_users = training_pools(dataset, user_keys, vectors, raw_train)
+    safe_positive, unsafe, safety_users = training_safety_pools(
+        dataset, user_keys, vectors, raw_train)
+    if args.model == "m2" and not len(safety_users):
+        raise ValueError("M2 needs profiled users with safe train positives and unsafe candidates.")
+    seed_all(args.seed)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {"architecture": "TransE" if args.backbone == "transe" else "repository LightGCN",
-                "backbone": args.backbone, "gamma": 12.0 if args.backbone == "transe" else None,
-                "embedding": args.embedding, "layers": args.layers,
+    manifest = {"architecture": "TransE", "training_objective": "margin_ranking",
+                "distance": args.distance, "margin": args.margin,
+                "embedding": args.embedding, "entity_count": len(kg["entity2id"]),
+                "relation_count": len(kg["relation2id"]),
                 "seed": args.seed, "epochs": args.epochs, "patience": args.patience,
                 "batch_size": args.batch_size, "learning_rate": args.learning_rate,
                 "checkpoint_selector": "validation safe-conditioned NDCG@10",
@@ -260,66 +309,67 @@ def train(args):
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     out = run_dir / args.model
     out.mkdir(exist_ok=False)
-    model_config = {"model": args.model, "backbone": args.backbone,
-                    "gamma": 12.0 if args.backbone == "transe" else None,
+    model_config = {"model": args.model, "architecture": "TransE",
+                    "training_objective": "TransE margin ranking loss",
+                    "distance": args.distance, "margin": args.margin,
                     "lambda_safe": args.lambda_safe if args.model == "m2" else 0.,
                     "delta": args.delta if args.model == "m2" else 0.}
     (out / "training_config.json").write_text(json.dumps(model_config, indent=2), encoding="utf-8")
-    model = build_model(dataset, args.seed, args.embedding, args.layers,
-                        args.backbone).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    model = build_model(kg, args.embedding, args.distance).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
     safety_rng = np.random.default_rng(args.seed + 1)
-    steps = math.ceil(dataset.trainDataSize / args.batch_size)
+    triple_sampler = KnownTripleSampler(
+        kg["triples"], len(kg["entity2id"]), len(kg["relation2id"]), args.seed)
     history, best, best_epoch, stale = [], -float("inf"), 0, 0
     for epoch in range(1, args.epochs + 1):
         model.train()
-        sums, count, safety_count = {"preference_loss": 0., "safety_loss": 0., "total_loss": 0.}, 0, 0
-        for _ in range(steps):
-            batch_users = rng.choice(train_users, size=args.batch_size, replace=True)
-            pos = np.asarray([rng.choice(positive[int(u)]) for u in batch_users])
-            neg = np.asarray([rng.choice(negative[int(u)]) for u in batch_users])
+        order = rng.permutation(len(kg["triples"]))
+        sums, count, safety_count = {"transe_loss": 0., "safety_loss": 0., "total_loss": 0.}, 0, 0
+        for start in range(0, len(order), args.batch_size):
+            indices = order[start:start + args.batch_size]
+            batch = kg["triples"][indices]
+            negative_batch = triple_sampler.sample(batch)
             as_tensor = lambda x: torch.as_tensor(x, dtype=torch.long, device=device)
-            uid = as_tensor(batch_users)
-            embeddings = model.computer() if args.backbone == "lightgcn" else None
-            pos_tensor, neg_tensor = as_tensor(pos), as_tensor(neg)
-            pos_scores = pair_scores(model, uid, pos_tensor, args.backbone, embeddings)
-            neg_scores = pair_scores(model, uid, neg_tensor, args.backbone, embeddings)
-            pref = torch.nn.functional.softplus(neg_scores - pos_scores).mean()
+            positive_tensor, negative_tensor = as_tensor(batch), as_tensor(negative_batch)
+            model.normalize_entities()
+            positive_scores = model.score_triples(*positive_tensor.unbind(dim=1))
+            negative_scores = model.score_triples(*negative_tensor.unbind(dim=1))
+            kg_loss = transe_margin_loss(positive_scores, negative_scores, args.margin)
             safe_loss = torch.zeros((), device=device)
             safety_pairs = 0
             if args.model == "m2":
-                rows, unsafe_items = [], []
-                for row, user in enumerate(batch_users):
-                    options = unsafe[int(user)]
-                    if len(options):
-                        rows.append(row)
-                        unsafe_items.append(int(safety_rng.choice(options)))
-                if rows:
-                    safety_pairs = len(rows)
-                    r = as_tensor(rows)
-                    safe_scores = pair_scores(
-                        model, uid[r], pos_tensor[rows], args.backbone, embeddings)
-                    unsafe_scores = pair_scores(
-                        model, uid[r], as_tensor(unsafe_items), args.backbone, embeddings)
-                    safe_loss = torch.relu(args.delta + unsafe_scores - safe_scores).mean()
-            total = pref + args.lambda_safe * safe_loss if args.model == "m2" else pref
+                safety_batch_users = safety_rng.choice(
+                    safety_users, size=len(batch), replace=True)
+                safe_items = np.asarray([
+                    safety_rng.choice(safe_positive[int(user)]) for user in safety_batch_users
+                ], dtype=np.int64)
+                unsafe_items = np.asarray([
+                    safety_rng.choice(unsafe[int(user)]) for user in safety_batch_users
+                ], dtype=np.int64)
+                user_tensor = as_tensor(safety_batch_users)
+                safe_scores = pair_scores(model, user_tensor, as_tensor(safe_items))
+                unsafe_scores = pair_scores(model, user_tensor, as_tensor(unsafe_items))
+                safe_loss = torch.relu(args.delta + unsafe_scores - safe_scores).mean()
+                safety_pairs = len(batch)
+            total = kg_loss + args.lambda_safe * safe_loss if args.model == "m2" else kg_loss
             if not torch.isfinite(total):
                 raise ValueError("Non-finite loss; stopping training.")
             optimizer.zero_grad(set_to_none=True)
             total.backward()
             optimizer.step()
-            n = len(batch_users)
-            sums["preference_loss"] += float(pref.detach()) * n
+            n = len(batch)
+            sums["transe_loss"] += float(kg_loss.detach()) * n
             sums["safety_loss"] += float(safe_loss.detach()) * safety_pairs
             safety_count += safety_pairs
             sums["total_loss"] += float(total.detach()) * n
             count += n
-        row = {"epoch": epoch, "preference_loss": sums["preference_loss"] / count,
+        model.normalize_entities()
+        row = {"epoch": epoch, "transe_loss": sums["transe_loss"] / count,
                "safety_loss": sums["safety_loss"] / safety_count if safety_count else 0.0,
                "total_loss": sums["total_loss"] / count}
         row["validation_safe_ndcg_at_10"] = validation_score(
-            model, dataset, val, raw_train, user_keys, vectors, profiles, args.backbone)
+            model, dataset, val, raw_train, user_keys, vectors, profiles)
         history.append(row)
         if row["validation_safe_ndcg_at_10"] > best:
             best, best_epoch, stale = row["validation_safe_ndcg_at_10"], epoch, 0
@@ -336,8 +386,9 @@ def train(args):
     (out / "training_summary.json").write_text(json.dumps({
         "best_epoch": best_epoch, "best_validation_safe_ndcg_at_10": best,
         "epochs_completed": len(history), "known_profile_users": known_profiles,
-        "training_users_with_pairs": int(len(train_users)), "device": str(device),
-        "backbone": args.backbone}, indent=2),
+        "kg_triples": int(len(kg["triples"])),
+        "training_users_with_safety_pairs": int(len(safety_users)), "device": str(device),
+        "architecture": "TransE", "training_objective": "margin_ranking"}, indent=2),
         encoding="utf-8")
     print(f"Saved {args.model.upper()} checkpoint at epoch {best_epoch}: {out}")
 
@@ -350,7 +401,7 @@ def plot_loss(history, path):
         return
     data = pd.DataFrame(history)
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    for col, label in [("preference_loss", "Preference"), ("safety_loss", "Safety"),
+    for col, label in [("transe_loss", "TransE margin"), ("safety_loss", "Safety"),
                        ("total_loss", "Total")]:
         ax.plot(data.epoch, data[col], label=label)
     ax.set(xlabel="Epoch", ylabel="Loss", title="Training loss components")
@@ -361,19 +412,17 @@ def plot_loss(history, path):
 
 
 @torch.no_grad()
-def score_model(model, dataset, backbone):
+def score_model(model, dataset):
     model.eval()
-    embeddings = model.computer() if backbone == "lightgcn" else None
     chunks = []
     for start in range(0, dataset.n_users, 64):
         user_ids = torch.arange(start, min(start + 64, dataset.n_users), device=dataset.device)
-        chunks.append(score_user_batch(
-            model, user_ids, backbone, embeddings, item_chunk_size=512).cpu())
+        chunks.append(score_user_batch(model, user_ids, item_chunk_size=512).cpu())
     return torch.cat(chunks).numpy()
 
 def evaluate(args):
     (root, profile_path, metadata, rules, profiles, _, test_frame, raw_train, val, test,
-     paths) = load_inputs(args.root, args.profiles)
+     paths, kg) = load_inputs(args.root, args.profiles)
     n_users = max(raw_train) + 1
     user_keys, vectors = build_safety_index(metadata, rules, profiles, n_users)
     run_dir = Path(args.run_dir).resolve()
@@ -386,10 +435,14 @@ def evaluate(args):
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(test)
-    apply_profile_safe_train_interactions(dataset, user_keys, vectors)
-    for _, model_name, _ in experiment_arms():
-        if not (run_dir / model_name / "best_checkpoint.pt").is_file():
-            raise FileNotFoundError(f"Train {model_name.upper()} before evaluation.")
+    arms = experiment_arms()
+    available_models = {
+        model_name for _, model_name, _ in arms
+        if (run_dir / model_name / "best_checkpoint.pt").is_file()
+    }
+    if not available_models:
+        raise FileNotFoundError(f"No trained TransE checkpoint found under {run_dir}.")
+    arms = [arm for arm in arms if arm[1] in available_models]
     relevance = {}
     for row in test_frame.itertuples():
         if float(row.rating) >= 4.0:
@@ -407,15 +460,13 @@ def evaluate(args):
         contexts[user] = (states, candidates, lookup, reference)
     example_users = set(sorted(u for u in profiles if profiles[u] is not None)[:200])
     examples, rows, score_cache = [], [], {}
-    for label, model_name, hard_filter in experiment_arms():
+    for label, model_name, hard_filter in arms:
         if model_name not in score_cache:
             checkpoint = torch.load(run_dir / model_name / "best_checkpoint.pt",
                                     map_location=device, weights_only=False)
-            model = build_model(dataset, manifest["seed"], manifest["embedding"],
-                                manifest["layers"], manifest["backbone"],
-                                manifest["gamma"]).to(device)
+            model = build_model(kg, manifest["embedding"], manifest["distance"]).to(device)
             model.load_state_dict(checkpoint["state_dict"])
-            score_cache[model_name] = score_model(model, dataset, manifest["backbone"])
+            score_cache[model_name] = score_model(model, dataset)
         scores = score_cache[model_name]
         for user in range(n_users):
             states, candidates, user_status, reference = contexts[user]
@@ -431,14 +482,6 @@ def evaluate(args):
                                 "item_id": item, "item_name": metadata.iloc[item].get("name", ""),
                                 "safety_status": states[item], "score": float(scores[user, item]),
                                 "baseline_rank": rank})
-                if label == "M1+Filter":
-                    base_top = set(unfiltered[:10])
-                    for rank, item in enumerate(ranked[:10], 1):
-                        if item not in base_top:
-                            examples.append({"user_id": user, "kind": "safe_lower_ranked_replacement",
-                                "item_id": item, "item_name": metadata.iloc[item].get("name", ""),
-                                "safety_status": states[item], "score": float(scores[user, item]),
-                                "filtered_rank": rank})
             if hard_filter and any(states[i] != SafetyStatus.SAFE.value for i in ranked[:20]):
                 raise AssertionError("Hard filter emitted a non-SAFE item.")
             for k in (5, 10, 20):
@@ -545,9 +588,9 @@ def main():
         p.add_argument("--root", default=str(ROOT_DEFAULT))
         p.add_argument("--profiles", required=True)
         p.add_argument("--seed", type=int, default=2020)
-        p.add_argument("--backbone", choices=("transe", "lightgcn"), default="transe")
         p.add_argument("--embedding", type=int, default=64)
-        p.add_argument("--layers", type=int, default=3)
+        p.add_argument("--distance", choices=("l1", "l2"), default="l1")
+        p.add_argument("--margin", type=float, default=1.0)
         p.add_argument("--epochs", type=int, default=300)
         p.add_argument("--patience", type=int, default=20)
         p.add_argument("--batch-size", type=int, default=1024)
@@ -568,6 +611,12 @@ def main():
     shared(sw)
     sw.add_argument("--output-dir", required=True)
     args = parser.parse_args()
+    if args.command in {"train", "sweep"} and (
+            args.embedding <= 0 or args.epochs <= 0 or args.patience <= 0 or
+            args.batch_size <= 0 or args.learning_rate <= 0 or args.margin <= 0):
+        parser.error("embedding, epochs, patience, batch-size, learning-rate and margin must be positive")
+    if args.command == "train" and args.model == "m2" and (args.lambda_safe <= 0 or args.delta < 0):
+        parser.error("M2 needs lambda-safe > 0 and delta >= 0")
     if args.command == "train":
         train(args)
     elif args.command == "evaluate":

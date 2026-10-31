@@ -200,9 +200,8 @@ def safe_ndcg(recommended, relevance, status, candidates, k, penalty=5, referenc
         "RecommendationCount": count, "P_IDCG@K": p_idcg, "P_NDCG_Undefined": p_idcg <= 0,
     }
 def experiment_arms():
-    """The four inference ablations evaluated against one shared candidate universe."""
-    return [("M1", "m1", False), ("M1+Filter", "m1", True),
-            ("M2", "m2", False), ("M2+Filter", "m2", True)]
+    """Compare the preference-only baseline with the complete safety-aware system."""
+    return [("M1", "m1", False), ("M2", "m2", True)]
 
 def candidate_universe(item_count, excluded):
     excluded = set(map(int, excluded))

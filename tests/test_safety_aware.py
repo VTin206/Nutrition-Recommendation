@@ -92,9 +92,9 @@ class SafetyAwareTests(unittest.TestCase):
                          ["diabetes", "hypertension"])
         self.assertIsNone(parse_profile_conditions("unrecognized_condition"))
 
-    def test_four_arms_share_candidate_splits(self):
+    def test_two_methods_share_candidate_splits_and_only_m2_filters(self):
         arms = experiment_arms()
-        self.assertEqual(len(arms), 4)
+        self.assertEqual(arms, [("M1", "m1", False), ("M2", "m2", True)])
         split = candidate_universe(5, [1, 3])
         self.assertTrue(all(candidate_universe(5, [1, 3]) == split for _ in arms))
 
