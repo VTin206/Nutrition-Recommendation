@@ -1,4 +1,4 @@
-"""M1/M2 safety-aware Food.com experiments on the repository's LightGCN backbone."""
+"""M1/M2 safety-aware Food.com experiments with TransE or LightGCN scoring."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -19,6 +19,7 @@ ROOT_DEFAULT = HERE
 sys.path.insert(0, str(ROOT_DEFAULT / "latest version LightGCN_PathSim"))
 from dataloader import Dataset, read_split
 from model import LightGCN
+from transe_model import TransERecommender
 
 
 def seed_all(seed):
@@ -114,8 +115,8 @@ def status_vector(user_keys, vectors, user):
     return np.full(len(next(iter(vectors.values()))), SafetyStatus.UNKNOWN.value, dtype=object)
 
 
-def apply_safe_train_graph(dataset, user_keys, vectors):
-    """Use identical, profile-eligible train edges for M1 and M2 graph propagation."""
+def apply_profile_safe_train_interactions(dataset, user_keys, vectors):
+    """Use identical profile-eligible train interactions for M1 and M2."""
     filtered = []
     for user, items in enumerate(dataset.allPos):
         state = status_vector(user_keys, vectors, user)
@@ -124,14 +125,36 @@ def apply_safe_train_graph(dataset, user_keys, vectors):
     dataset.trainDataSize = sum(len(x) for x in filtered)
     dataset._graph = None
     if not dataset.trainDataSize:
-        raise ValueError("Safety profiles leave no safe train edges for LightGCN.")
+        raise ValueError("Safety profiles leave no profile-eligible train interactions for this backbone.")
 
 
-def build_model(dataset, seed, embedding, layers):
+def build_model(dataset, seed, embedding, layers, backbone="transe", gamma=12.0):
     seed_all(seed)
-    config = {"latent_dim_rec": embedding, "lightGCN_n_layers": layers,
-              "keep_prob": 1.0, "A_split": False, "pretrain": 0, "dropout": 0}
-    return LightGCN(config, dataset)
+    if backbone == "transe":
+        return TransERecommender(dataset.n_users, dataset.m_items, embedding, gamma)
+    if backbone == "lightgcn":
+        config = {"latent_dim_rec": embedding, "lightGCN_n_layers": layers,
+                  "keep_prob": 1.0, "A_split": False, "pretrain": 0, "dropout": 0}
+        return LightGCN(config, dataset)
+    raise ValueError(f"Unsupported backbone: {backbone}")
+
+
+def pair_scores(model, user_ids, item_ids, backbone, embeddings=None):
+    if backbone == "transe":
+        return model.score_pairs(user_ids, item_ids)
+    if embeddings is None:
+        embeddings = model.computer()
+    users_emb, items_emb = embeddings
+    return (users_emb[user_ids] * items_emb[item_ids]).sum(dim=1)
+
+
+def score_user_batch(model, user_ids, backbone, embeddings=None, item_chunk_size=1024):
+    if backbone == "transe":
+        return model.score_all(user_ids, item_chunk_size=item_chunk_size)
+    if embeddings is None:
+        embeddings = model.computer()
+    users_emb, items_emb = embeddings
+    return users_emb[user_ids] @ items_emb.T
 
 
 def training_pools(dataset, user_keys, vectors, raw_train):
@@ -155,7 +178,7 @@ def training_pools(dataset, user_keys, vectors, raw_train):
         raise ValueError("No profiled user has safe train positives and safe unobserved items.")
     return positive, negative, unsafe, np.asarray(users, dtype=np.int64)
 
-def validation_score(model, dataset, val, raw_train, user_keys, vectors, profiles, k=10):
+def validation_score(model, dataset, val, raw_train, user_keys, vectors, profiles, backbone, k=10):
     """Binary safe-conditioned validation NDCG; validation text has no star ratings."""
     active, relevant_by_user = [], {}
     for user, heldout in val.items():
@@ -171,11 +194,11 @@ def validation_score(model, dataset, val, raw_train, user_keys, vectors, profile
     model.eval()
     values_by_user = []
     with torch.no_grad():
-        users_emb, items_emb = model.computer()
+        embeddings = model.computer() if backbone == "lightgcn" else None
         for start in range(0, len(active), 64):
             user_batch = active[start:start + 64]
-            ids = torch.as_tensor(user_batch, dtype=torch.long, device=users_emb.device)
-            score_batch = (users_emb[ids] @ items_emb.T).cpu().numpy()
+            ids = torch.as_tensor(user_batch, dtype=torch.long, device=dataset.device)
+            score_batch = score_user_batch(model, ids, backbone, embeddings).cpu().numpy()
             for row, user in enumerate(user_batch):
                 states = status_vector(user_keys, vectors, user)
                 seen = np.zeros(dataset.m_items, dtype=bool)
@@ -203,7 +226,7 @@ def input_hashes(root, profile_path, paths):
     sources = [root / "latest version LightGCN_PathSim/model.py",
                root / "latest version LightGCN_PathSim/dataloader.py",
                root / "latest version LightGCN_PathSim/world.py",
-               HERE / "experiment.py", HERE / "safety_aware.py"]
+               HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py"]
     return {str(p.relative_to(root)) if p.is_relative_to(root) else str(p): digest(p)
             for p in paths + [profile_path] + sources}
 
@@ -218,14 +241,15 @@ def train(args):
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(val)
-    apply_safe_train_graph(dataset, user_keys, vectors)
+    apply_profile_safe_train_interactions(dataset, user_keys, vectors)
     positive, negative, unsafe, train_users = training_pools(dataset, user_keys, vectors, raw_train)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {"architecture": "repository LightGCN", "embedding": args.embedding,
-                "layers": args.layers, "seed": args.seed, "epochs": args.epochs,
-                "patience": args.patience, "batch_size": args.batch_size,
-                "learning_rate": args.learning_rate,
+    manifest = {"architecture": "TransE" if args.backbone == "transe" else "repository LightGCN",
+                "backbone": args.backbone, "gamma": 12.0 if args.backbone == "transe" else None,
+                "embedding": args.embedding, "layers": args.layers,
+                "seed": args.seed, "epochs": args.epochs, "patience": args.patience,
+                "batch_size": args.batch_size, "learning_rate": args.learning_rate,
                 "checkpoint_selector": "validation safe-conditioned NDCG@10",
                 "input_sha256": input_hashes(root, profile_path, paths)}
     manifest_path = run_dir / "experiment.json"
@@ -236,10 +260,13 @@ def train(args):
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     out = run_dir / args.model
     out.mkdir(exist_ok=False)
-    model_config = {"model": args.model, "lambda_safe": args.lambda_safe if args.model == "m2" else 0.,
+    model_config = {"model": args.model, "backbone": args.backbone,
+                    "gamma": 12.0 if args.backbone == "transe" else None,
+                    "lambda_safe": args.lambda_safe if args.model == "m2" else 0.,
                     "delta": args.delta if args.model == "m2" else 0.}
     (out / "training_config.json").write_text(json.dumps(model_config, indent=2), encoding="utf-8")
-    model = build_model(dataset, args.seed, args.embedding, args.layers).to(device)
+    model = build_model(dataset, args.seed, args.embedding, args.layers,
+                        args.backbone).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
     safety_rng = np.random.default_rng(args.seed + 1)
@@ -254,10 +281,11 @@ def train(args):
             neg = np.asarray([rng.choice(negative[int(u)]) for u in batch_users])
             as_tensor = lambda x: torch.as_tensor(x, dtype=torch.long, device=device)
             uid = as_tensor(batch_users)
-            all_users, all_items = model.computer()
-            pref = torch.nn.functional.softplus(
-                -((all_users[uid] * (all_items[as_tensor(pos)] - all_items[as_tensor(neg)]))
-                  .sum(dim=1))).mean()
+            embeddings = model.computer() if args.backbone == "lightgcn" else None
+            pos_tensor, neg_tensor = as_tensor(pos), as_tensor(neg)
+            pos_scores = pair_scores(model, uid, pos_tensor, args.backbone, embeddings)
+            neg_scores = pair_scores(model, uid, neg_tensor, args.backbone, embeddings)
+            pref = torch.nn.functional.softplus(neg_scores - pos_scores).mean()
             safe_loss = torch.zeros((), device=device)
             safety_pairs = 0
             if args.model == "m2":
@@ -270,8 +298,10 @@ def train(args):
                 if rows:
                     safety_pairs = len(rows)
                     r = as_tensor(rows)
-                    safe_scores = (all_users[uid[r]] * all_items[as_tensor(pos[rows])]).sum(1)
-                    unsafe_scores = (all_users[uid[r]] * all_items[as_tensor(unsafe_items)]).sum(1)
+                    safe_scores = pair_scores(
+                        model, uid[r], pos_tensor[rows], args.backbone, embeddings)
+                    unsafe_scores = pair_scores(
+                        model, uid[r], as_tensor(unsafe_items), args.backbone, embeddings)
                     safe_loss = torch.relu(args.delta + unsafe_scores - safe_scores).mean()
             total = pref + args.lambda_safe * safe_loss if args.model == "m2" else pref
             if not torch.isfinite(total):
@@ -289,7 +319,7 @@ def train(args):
                "safety_loss": sums["safety_loss"] / safety_count if safety_count else 0.0,
                "total_loss": sums["total_loss"] / count}
         row["validation_safe_ndcg_at_10"] = validation_score(
-            model, dataset, val, raw_train, user_keys, vectors, profiles)
+            model, dataset, val, raw_train, user_keys, vectors, profiles, args.backbone)
         history.append(row)
         if row["validation_safe_ndcg_at_10"] > best:
             best, best_epoch, stale = row["validation_safe_ndcg_at_10"], epoch, 0
@@ -306,7 +336,8 @@ def train(args):
     (out / "training_summary.json").write_text(json.dumps({
         "best_epoch": best_epoch, "best_validation_safe_ndcg_at_10": best,
         "epochs_completed": len(history), "known_profile_users": known_profiles,
-        "training_users_with_pairs": int(len(train_users)), "device": str(device)}, indent=2),
+        "training_users_with_pairs": int(len(train_users)), "device": str(device),
+        "backbone": args.backbone}, indent=2),
         encoding="utf-8")
     print(f"Saved {args.model.upper()} checkpoint at epoch {best_epoch}: {out}")
 
@@ -330,11 +361,14 @@ def plot_loss(history, path):
 
 
 @torch.no_grad()
-def score_model(model, dataset):
+def score_model(model, dataset, backbone):
     model.eval()
-    users, items = model.computer()
-    chunks = [(users[a:a + 64] @ items.T).cpu()
-              for a in range(0, dataset.n_users, 64)]
+    embeddings = model.computer() if backbone == "lightgcn" else None
+    chunks = []
+    for start in range(0, dataset.n_users, 64):
+        user_ids = torch.arange(start, min(start + 64, dataset.n_users), device=dataset.device)
+        chunks.append(score_user_batch(
+            model, user_ids, backbone, embeddings, item_chunk_size=512).cpu())
     return torch.cat(chunks).numpy()
 
 def evaluate(args):
@@ -352,7 +386,7 @@ def evaluate(args):
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(test)
-    apply_safe_train_graph(dataset, user_keys, vectors)
+    apply_profile_safe_train_interactions(dataset, user_keys, vectors)
     for _, model_name, _ in experiment_arms():
         if not (run_dir / model_name / "best_checkpoint.pt").is_file():
             raise FileNotFoundError(f"Train {model_name.upper()} before evaluation.")
@@ -378,9 +412,10 @@ def evaluate(args):
             checkpoint = torch.load(run_dir / model_name / "best_checkpoint.pt",
                                     map_location=device, weights_only=False)
             model = build_model(dataset, manifest["seed"], manifest["embedding"],
-                                manifest["layers"]).to(device)
+                                manifest["layers"], manifest["backbone"],
+                                manifest["gamma"]).to(device)
             model.load_state_dict(checkpoint["state_dict"])
-            score_cache[model_name] = score_model(model, dataset)
+            score_cache[model_name] = score_model(model, dataset, manifest["backbone"])
         scores = score_cache[model_name]
         for user in range(n_users):
             states, candidates, user_status, reference = contexts[user]
@@ -510,6 +545,7 @@ def main():
         p.add_argument("--root", default=str(ROOT_DEFAULT))
         p.add_argument("--profiles", required=True)
         p.add_argument("--seed", type=int, default=2020)
+        p.add_argument("--backbone", choices=("transe", "lightgcn"), default="transe")
         p.add_argument("--embedding", type=int, default=64)
         p.add_argument("--layers", type=int, default=3)
         p.add_argument("--epochs", type=int, default=300)
