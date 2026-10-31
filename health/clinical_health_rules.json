@@ -1,0 +1,107 @@
+{
+  "metadata": {
+    "title": "Clinical Health Constraints & Dietary Thresholds for Food.com 10-Core Benchmark",
+    "version": "1.2-formalized",
+    "status": "Advisor-Approved Research Constraints Formalization",
+    "updated_at": "2026-10-16",
+    "nutrient_reference_standards": {
+      "sodium_daily_value_mg": 2400.0,
+      "fda_general_daily_value_added_sugars_g": 50.0,
+      "foodcom_inferred_total_sugars_basis_g": 25.0,
+      "fat_daily_value_g": 65.0,
+      "protein_daily_value_g": 50.0,
+      "reference_energy_kcal": 2000.0
+    },
+    "historical_foodcom_sugar_basis_note": "Food.com legacy nutrition label displays total sugars relative to an empirical ~25g reference basis (e.g., Recipe 39087 shows 3.1g = 12% PDV). Therefore, 44% PDV represents nominal ~11.0g total sugar per dish, blunting acute postprandial hyperglycemia spikes in accordance with ADA/WHO.",
+    "budgetary_principle": "1/3 Per-Meal Dietary Budget Formulation (with 50% main-dish daily allowance allocation for CKD Protein: 24g/meal) & Histology-Proven Energy Density"
+  },
+  "diseases": {
+    "hypertension": {
+      "disease_id": "hypertension",
+      "name_vi": "Tăng huyết áp",
+      "name_en": "Hypertension",
+      "controlling_nutrient": "Sodium (Natri)",
+      "threshold_condition": "sodium_pdv <= 25.0",
+      "per_meal_limit": "<= 600 mg Sodium (25.0% PDV on 2400mg Daily Value)",
+      "clinical_source": "2025 AHA/ACC Guideline for High Blood Pressure in Adults & DASH-Sodium Trial (NEJM 2001)",
+      "doi": "10.1161/HYP.0000000000000249",
+      "safe_recipes": 6154,
+      "safe_ratio_pct": 65.84,
+      "pathophysiology_rationale": "Restricting per-meal sodium to <= 25% PDV (<= 600mg, mapping daily target <2300mg to 1/3 per-meal budget) blunts acute postprandial intravascular volume expansion and prevents sympathetic arteriolar vasoconstriction."
+    },
+    "diabetes": {
+      "disease_id": "diabetes",
+      "name_vi": "Đái tháo đường Tuýp 2",
+      "name_en": "Type-2 Diabetes",
+      "controlling_nutrient": "Total Sugars (Đường tổng số; Food.com historical % PDV reference ~25g basis, nominal ~11.0g per meal)",
+      "threshold_condition": "sugar_pdv <= 44.0",
+      "per_meal_limit": "<= 44.0% PDV (~11.0g nominal Sugar on ~25g Food.com reference basis)",
+      "clinical_source": "ADA Standards of Care in Diabetes (2026, Section 5) & WHO Guidelines",
+      "doi": "10.2337/dc26-S005",
+      "safe_recipes": 6532,
+      "safe_ratio_pct": 69.88,
+      "pathophysiology_rationale": "Restricting sugar to <= 44% PDV (~11.0g nominal total sugar on Food.com ~25g reference basis) blunts acute postprandial glycemic excursions, endothelial glucotoxicity, and pancreatic beta-cell strain, in alignment with ADA 2026 Section 5 and WHO guidelines."
+    },
+    "heart_failure": {
+      "disease_id": "heart_failure",
+      "name_vi": "Suy tim",
+      "name_en": "Heart Failure",
+      "controlling_nutrients": "Sodium (Natri) & Total Fat (Chất béo tổng)",
+      "threshold_condition": "sodium_pdv <= 25.0 and fat_pdv <= 38.0",
+      "per_meal_limit": "<= 600 mg Sodium & <= 25.0 g Total Fat",
+      "clinical_source": "ESC/HFA Clinical Consensus Statement on Sodium and Fluid Intake (European Journal of Heart Failure 2024, 26(4):730-741, doi:10.1002/ejhf.3244) & 2022 AHA/ACC/HFSA Guideline for Management of Heart Failure",
+      "doi": "10.1002/ejhf.3244",
+      "safe_recipes": 5389,
+      "safe_ratio_pct": 57.65,
+      "pathophysiology_rationale": "Dual-nutrient control: Sodium <= 25% prevents circulatory volume overload and pulmonary congestion; Fat <= 38% reduces coronary ischemia and myocardial workload."
+    },
+    "steatohepatitis": {
+      "disease_id": "steatohepatitis",
+      "alias": [
+        "hepatitis",
+        "fatty_liver"
+      ],
+      "name_vi": "Viêm gan nhiễm mỡ",
+      "name_en": "Steatohepatitis (MASH / NASH)",
+      "controlling_nutrient": "Total Fat Energy Density (Tỷ lệ năng lượng từ chất béo <= 30%)",
+      "threshold_condition": "19.5 * fat_pdv <= calories",
+      "per_meal_limit": "Fat energy contribution <= 30% of total calories (19.5 * fat_pdv <= calories)",
+      "clinical_source": "Promrat et al. (Hepatology 2010 RCT) & General Dietary Guidelines (WHO/AHA dietary fat energy <= 30%)",
+      "doi": "10.1002/hep.23276",
+      "pmid": "19827166",
+      "pmcid": "PMC2799538",
+      "safe_recipes": 2742,
+      "safe_ratio_pct": 29.34,
+      "pathophysiology_rationale": "Promrat et al. (Hepatology 2010 RCT) demonstrated that dietary fat energy restriction (tested at 25% fat diet) with weight loss induces histological NASH resolution and reverses ballooning. General dietary standards (WHO/AHA) recommend keeping total fat <= 30% of energy. The formulation 19.5 * fat_pdv <= calories operationalizes fat energy <= 30% as our per-meal research constraint."
+    },
+    "hepatitis": {
+      "disease_id": "hepatitis",
+      "alias_of": "steatohepatitis",
+      "threshold_condition": "19.5 * fat_pdv <= calories",
+      "safe_recipes": 2742,
+      "safe_ratio_pct": 29.34
+    },
+    "kidney_failure": {
+      "disease_id": "kidney_failure",
+      "name_vi": "Suy thận mạn (CKD G3–G5)",
+      "name_en": "Chronic Kidney Disease",
+      "controlling_nutrient": "Protein (Chất đạm)",
+      "threshold_condition": "protein_pdv <= 48.0",
+      "per_meal_limit": "<= 48.0% PDV (nominal ~24.0g Protein on 50g reference basis)",
+      "clinical_source": "KDIGO 2024 Clinical Practice Guideline for CKD (Recommendation 3.3.1.1, Grade 2C: 0.8g protein/kg/day) & ADA Standards of Care (2026)",
+      "doi": "10.1016/j.kint.2023.10.018",
+      "safe_recipes": 6801,
+      "safe_ratio_pct": 72.76,
+      "pathophysiology_rationale": "KDIGO 2024 Recommendation 3.3.1.1 (Grade 2C) establishes 0.8 g protein/kg/day for adults with CKD G3-G5. For a standard 60kg adult (48g/day), the 48% PDV limit (~24.0g protein on a 50g reference basis) allocates 50% of daily protein allowance to the primary main meal to mitigate intraglomerular hyperfiltration."
+    },
+    "comorbidity": {
+      "disease_id": "comorbidity",
+      "name_vi": "Đa bệnh lý (Tổng hợp cả 5 bệnh)",
+      "name_en": "Comorbidity (All 5 Target Conditions)",
+      "threshold_condition": "sodium_pdv <= 25.0 and sugar_pdv <= 44.0 and (sodium_pdv <= 25.0 and fat_pdv <= 38.0) and 19.5 * fat_pdv <= calories and protein_pdv <= 48.0",
+      "safe_recipes": 1175,
+      "safe_ratio_pct": 12.57,
+      "pathophysiology_rationale": "Simultaneous satisfaction of cardiovascular, endocrine, hepatic, and renal clinical constraints, providing 1,175 verified safe recipes for high-risk patients."
+    }
+  }
+}
