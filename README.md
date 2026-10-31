@@ -52,17 +52,29 @@ The validation split has item IDs but no star ratings, so checkpoint selection u
 
 ## Run in Colab
 
-Upload this entire folder to Drive, mount Drive, and set the folder and selected health scenario:
+Open a new Colab notebook. Clone the repository so the code and bundled data are downloaded directly from Git:
+
+```python
+%cd /content
+!git clone --depth 1 --branch main https://github.com/VTin206/Nutrition-Recommendation.git
+ROOT = '/content/Nutrition-Recommendation'
+```
+
+Mount Drive only to keep the trained models and evaluation results after the Colab runtime ends:
 
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
-ROOT = '/content/drive/MyDrive/safety_aware_food_recommendation'
+from pathlib import Path
+
+ROOT = '/content/Nutrition-Recommendation'
+OUTPUT_ROOT = Path('/content/drive/MyDrive/safety_aware_food_recommendation')
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 HEALTH_CONDITION = 'hypertension'
-RUN = ROOT + '/runs/transe_hypertension'
+RUN = str(OUTPUT_ROOT / 'runs' / 'transe_hypertension')
 ```
 
-Install the listed requirements:
+Install the dependencies from the cloned repository:
 
 ```bash
 !pip install -q -r "$ROOT/requirements.txt"
@@ -81,15 +93,15 @@ Then evaluate both models:
 !python "$ROOT/experiment.py" evaluate --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN"
 ```
 
-The condition used for evaluation must match the condition used in training. For another disease, change both `HEALTH_CONDITION` and `RUN` (for example `diabetes` and `runs/transe_diabetes`) and train both models again. This keeps different condition scenarios in separate result folders.
+The condition used for evaluation must match the condition used in training. For another disease, change both `HEALTH_CONDITION` and `RUN` (for example `diabetes` and `transe_diabetes`) and train both models again. This keeps different condition scenarios in separate result folders. Use a new run folder if you train again; an existing run folder already contains checkpoints and a manifest.
 
 Optional M2 validation sweep:
 
 ```bash
-!python "$ROOT/experiment.py" sweep --root "$ROOT" --health-condition "$HEALTH_CONDITION" --output-dir "$ROOT/runs/sweep_hypertension" --embedding 64 --distance l1 --margin 1.0 --epochs 300 --patience 20 --seed 2020
+!python "$ROOT/experiment.py" sweep --root "$ROOT" --health-condition "$HEALTH_CONDITION" --output-dir "$OUTPUT_ROOT/runs/sweep_hypertension" --embedding 64 --distance l1 --margin 1.0 --epochs 300 --patience 20 --seed 2020
 ```
 
-Each run manifest records the selected health condition and hashes the inputs and source code. Use a fresh run folder after changing data or settings.
+Each run manifest records the selected health condition and hashes the inputs and source code. The code and dataset are read from `/content/Nutrition-Recommendation`; checkpoints, CSV tables, and charts are saved to the Drive `RUN` folder.
 
 ## Outputs
 
