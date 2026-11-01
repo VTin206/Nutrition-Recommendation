@@ -25,6 +25,14 @@ from transe_model import TransERecommender
 PYKEEN_VERSION = package_version("pykeen")
 # The P=5-only evaluation update does not alter model training or checkpoints.
 PRE_P5_EVALUATION_SOURCE_HASH = "2fe0a7929a6c1fa4b2f46ae28e53c746ded7476d2ed955ff3da39c3dd1096ede"
+# The K=10-only evaluation update also leaves training and checkpoints unchanged.
+PRE_K10_EVALUATION_SOURCE_HASH = "a67e721f90d629cd2cd4f33414635ba7939c47a314312d8cf041b448162f7b92"
+# Restricting the reported metrics also changes evaluation output only.
+PRE_SELECTED_METRICS_SOURCE_HASH = "d0ce62b0bc6a10ea407993e052bd47327433f51db2f8a771b763595224c37c35"
+
+USER_METRICS = ["Safety@K", "Unsafe@1", "Unknown@K", "P-NDCG@K", "NDCG@K",
+                "Precision@K", "Recall@K"]
+REPORTED_METRICS = [*USER_METRICS, "RecommendationCoverage"]
 
 
 def seed_all(seed):
@@ -442,11 +450,15 @@ def evaluate(args):
     current_hashes = input_hashes(root, paths)
     changed_hashes = [name for name in set(expected_hashes) | set(current_hashes)
                       if expected_hashes.get(name) != current_hashes.get(name)]
-    p5_only_code_change = (
+    evaluation_only_code_change = (
         set(changed_hashes) == {"experiment.py"} and
-        expected_hashes.get("experiment.py") == PRE_P5_EVALUATION_SOURCE_HASH
+        expected_hashes.get("experiment.py") in {
+            PRE_P5_EVALUATION_SOURCE_HASH,
+            PRE_K10_EVALUATION_SOURCE_HASH,
+            PRE_SELECTED_METRICS_SOURCE_HASH,
+        }
     )
-    if changed_hashes and not p5_only_code_change:
+    if changed_hashes and not evaluation_only_code_change:
         raise ValueError(
             "Evaluation data/code/dependency hashes differ from training. "
             "For the PyKEEN TransE implementation, train new checkpoints in a fresh run folder."
@@ -504,15 +516,15 @@ def evaluate(args):
             user_status = StatusLookup(states)
             if user in example_users:
                 if label == "M1":
-                    for rank, item in enumerate(unfiltered[:20], 1):
+                    for rank, item in enumerate(unfiltered[:10], 1):
                         if states[item] != SafetyStatus.SAFE.value:
-                            examples.append({"user_id": user, "kind": "baseline_non_safe_top20",
+                            examples.append({"user_id": user, "kind": "baseline_non_safe_top10",
                                 "item_id": item, "item_name": metadata.iloc[item].get("name", ""),
                                 "safety_status": states[item], "score": float(scores[user, item]),
                                 "baseline_rank": rank})
-            if hard_filter and any(states[i] != SafetyStatus.SAFE.value for i in ranked[:20]):
+            if hard_filter and any(states[i] != SafetyStatus.SAFE.value for i in ranked[:10]):
                 raise AssertionError("Hard filter emitted a non-SAFE item.")
-            for k in (5, 10, 20):
+            for k in (10,):
                 recs = ranked[:k]
                 base = safe_ndcg(recs, relevance.get(user, {}), user_status, candidates, k, 5, reference)
                 rec_rel = [float(relevance.get(user, {}).get(i, 0.0)) for i in recs]
@@ -522,6 +534,10 @@ def evaluate(args):
                     metrics["P-DCG@K"] = dcg(rec_rel, k, safe_flags, penalty)
                     metrics["P-NDCG@K"] = (metrics["P-DCG@K"] / base["P_IDCG@K"]
                         if base["P_IDCG@K"] > 0 else None)
+                    returned = metrics["RecommendationCount"]
+                    metrics["Unknown@K"] = (
+                        metrics["Unknown@K"] / returned if returned else None
+                    )
                     rows.append({"health_condition": "|".join(conditions),
                         "system": label, "model": model_name, "hard_filter": hard_filter,
                         "user_id": user, "K": k, "penalty_P": penalty, "catalog_size": dataset.m_items,
@@ -531,7 +547,9 @@ def evaluate(args):
                         "safe_returned_count": sum(user_status.get(i) == SafetyStatus.SAFE for i in recs),
                         **metrics})
         print(f"Evaluated {label}", flush=True)
-    pd.DataFrame(rows).to_csv(run_dir / "per_user_metrics.csv", index=False)
+    per_user_columns = ["health_condition", "system", "model", "hard_filter",
+                        "user_id", "K", "penalty_P", *USER_METRICS]
+    pd.DataFrame(rows)[per_user_columns].to_csv(run_dir / "per_user_metrics.csv", index=False)
     table = aggregate_rows(rows)
     table.to_csv(run_dir / "model_comparison.csv", index=False)
     pd.DataFrame(examples).to_csv(run_dir / "recommendation_examples.csv", index=False)
@@ -541,25 +559,17 @@ def evaluate(args):
 
 def aggregate_rows(rows):
     frame = pd.DataFrame(rows)
-    metrics = ["Safety@K", "SafetyAmongReturned", "FillRate@K", "P-DCG@K", "P-NDCG@K",
-        "NDCG@K", "Precision@K", "Recall@K", "EligiblePrecision@K", "EligibleRecall@K",
-        "Unsafe@1", "Unknown@K", "RecommendationCount"]
     group_cols = ["health_condition", "system", "model", "hard_filter", "K", "penalty_P"]
     output = []
     for key, part in frame.groupby(group_cols, dropna=False, sort=False):
         record = dict(zip(group_cols, key))
         record["users_evaluated"] = int(part.user_id.nunique())
-        record["full_list_users"] = int(part["Safety@K"].notna().sum())
-        record["short_list_users"] = int(part.coverage_status.str.startswith("INSUFFICIENT").sum())
-        record["undefined_P_NDCG_users"] = int(part["P-NDCG@K"].isna().sum())
-        for metric in metrics:
+        for metric in USER_METRICS:
             record[metric] = part[metric].mean() if part[metric].notna().any() else np.nan
-        n_recs = int(part.RecommendationCount.sum())
-        record["PooledSafetyAmongReturned"] = int(part.safe_returned_count.sum()) / n_recs if n_recs else np.nan
         distinct = {item for recs in part.recommended for item in recs}
         record["RecommendationCoverage"] = len(distinct) / int(part.catalog_size.iloc[0])
         output.append(record)
-    return pd.DataFrame(output)
+    return pd.DataFrame(output, columns=[*group_cols, "users_evaluated", *REPORTED_METRICS])
 
 
 def plot_metrics(table, folder):
@@ -568,9 +578,11 @@ def plot_metrics(table, folder):
     except ImportError:
         print("matplotlib unavailable; saved comparison tables only.", flush=True)
         return
-    charts = [("Safety@K", "safety_at_k.png"), ("P-NDCG@K", "p_ndcg_at_k.png"),
-        ("NDCG@K", "ndcg_at_k.png"), ("Recall@K", "recall_at_k.png"),
-        ("FillRate@K", "fill_rate_at_k.png")]
+    charts = [("Safety@K", "safety_at_k.png"), ("Unsafe@1", "unsafe_at_1.png"),
+        ("Unknown@K", "unknown_at_k.png"), ("P-NDCG@K", "p_ndcg_at_k.png"),
+        ("NDCG@K", "ndcg_at_k.png"), ("Precision@K", "precision_at_k.png"),
+        ("Recall@K", "recall_at_k.png"),
+        ("RecommendationCoverage", "recommendation_coverage.png")]
     for metric, filename in charts:
         fig, ax = plt.subplots(figsize=(8, 4.5))
         for name, group in table[table.penalty_P == 5].groupby("system"):

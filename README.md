@@ -50,7 +50,7 @@ Because PyKEEN changes the model implementation and checkpoint format, train bot
 
 ## Evaluation
 
-The evaluator reports metrics at K=5, 10, and 20: Safety@K, SafetyAmongReturned, FillRate@K, P-DCG/P-NDCG, NDCG, Precision, Recall, safety-conditioned Precision/Recall, Unsafe@1, Unknown@K, recommendation coverage, and sample counts. Recall is undefined when its relevant-item pool is empty. Safety@K is only reported for a full K-item list; short lists report SafetyAmongReturned and FillRate@K.
+The evaluator reports only these metrics at K=10: Safety@K, Unsafe@1, Unknown@K, P-NDCG@K, NDCG@K, Precision@K, Recall@K, and RecommendationCoverage. The comparison table also identifies the health scenario, model, K, penalty, and number of evaluated users. Safety@K is undefined for users who receive fewer than 10 recipes. Unknown@K is the fraction of returned recipes whose safety status is UNKNOWN. RecommendationCoverage is the fraction of the recipe catalog recommended at least once; it measures item/catalog coverage, not the fraction of users reached. Recall@K is undefined when a user's relevant-item pool is empty.
 
 P-NDCG uses gain `2^relevance - 1` for SAFE recipes and `2^(-P) - 1` for non-SAFE recipes. `P` is the nominal penalty; `2^(-P)-1` is the actual negative gain. The evaluator reports P-NDCG only for `P = 5`; charts and example comparisons also use `P = 5`. The ideal DCG uses SAFE relevant recipes from the same candidate set. A zero ideal DCG produces undefined P-NDCG, and negative scores are not clipped. Changing `P` only changes evaluation, so existing checkpoints can be reused without retraining.
 
@@ -113,7 +113,7 @@ Each run manifest records the selected health condition and hashes the inputs an
 
 ## Outputs
 
-Each model folder saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. Evaluation saves per-user and aggregate metric tables, recommendation examples, and charts for Safety@K, P-NDCG@K, NDCG@K, Recall@K, and FillRate@K.
+Each model folder saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. Evaluation saves per-user and aggregate tables containing only the selected metrics, recommendation examples, and charts for those metrics.
 
 ## Tests
 
