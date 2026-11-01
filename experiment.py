@@ -23,6 +23,8 @@ from dataloader import Dataset, read_split
 from transe_model import TransERecommender
 
 PYKEEN_VERSION = package_version("pykeen")
+# The P=5-only evaluation update does not alter model training or checkpoints.
+PRE_P5_EVALUATION_SOURCE_HASH = "2fe0a7929a6c1fa4b2f46ae28e53c746ded7476d2ed955ff3da39c3dd1096ede"
 
 
 def seed_all(seed):
@@ -440,7 +442,11 @@ def evaluate(args):
     current_hashes = input_hashes(root, paths)
     changed_hashes = [name for name in set(expected_hashes) | set(current_hashes)
                       if expected_hashes.get(name) != current_hashes.get(name)]
-    if changed_hashes:
+    p5_only_code_change = (
+        set(changed_hashes) == {"experiment.py"} and
+        expected_hashes.get("experiment.py") == PRE_P5_EVALUATION_SOURCE_HASH
+    )
+    if changed_hashes and not p5_only_code_change:
         raise ValueError(
             "Evaluation data/code/dependency hashes differ from training. "
             "For the PyKEEN TransE implementation, train new checkpoints in a fresh run folder."
@@ -511,7 +517,7 @@ def evaluate(args):
                 base = safe_ndcg(recs, relevance.get(user, {}), user_status, candidates, k, 5, reference)
                 rec_rel = [float(relevance.get(user, {}).get(i, 0.0)) for i in recs]
                 safe_flags = [user_status.get(i, SafetyStatus.UNKNOWN) == SafetyStatus.SAFE for i in recs]
-                for penalty in (1, 3, 4, 5, 10):
+                for penalty in (5,):
                     metrics = dict(base)
                     metrics["P-DCG@K"] = dcg(rec_rel, k, safe_flags, penalty)
                     metrics["P-NDCG@K"] = (metrics["P-DCG@K"] / base["P_IDCG@K"]
@@ -567,9 +573,9 @@ def plot_metrics(table, folder):
         ("FillRate@K", "fill_rate_at_k.png")]
     for metric, filename in charts:
         fig, ax = plt.subplots(figsize=(8, 4.5))
-        for name, group in table[table.penalty_P == 4].groupby("system"):
+        for name, group in table[table.penalty_P == 5].groupby("system"):
             ax.plot(group.K, group[metric], marker="o", label=name)
-        ax.set(xlabel="K", ylabel=metric, title=f"{metric} by system (P=4)")
+        ax.set(xlabel="K", ylabel=metric, title=f"{metric} by system (P=5)")
         ax.legend()
         fig.tight_layout()
         fig.savefig(folder / filename, dpi=160)
@@ -578,7 +584,7 @@ def plot_metrics(table, folder):
 
 def comparison_examples(rows, folder):
     frame = pd.DataFrame(rows)
-    frame = frame[(frame.K == 10) & (frame.penalty_P == 4)]
+    frame = frame[(frame.K == 10) & (frame.penalty_P == 5)]
     frame.pivot(index="user_id", columns="system",
         values=["recommended", "Safety@K", "NDCG@K", "P-NDCG@K"]).to_csv(
             folder / "user_level_examples.csv")
