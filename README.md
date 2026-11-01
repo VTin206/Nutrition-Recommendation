@@ -26,21 +26,27 @@ The old per-user profile template is no longer needed and has been removed. You 
 - The CSV interaction files provide preference labels for final test evaluation. Rating 4 maps to relevance 1 and rating 5 maps to relevance 2.
 - This experiment trains **TransE only**. The bundled LightGCN files are retained for the shared data loader.
 
+## TransE implementation and objectives
+
+The TransE architecture, triple scoring, entity constraint, margin-ranking loss, and filtered negative sampler come from **PyKEEN 1.11.1**. This project does not implement TransE itself. PyKEEN provides a library implementation, not a pretrained Food.com checkpoint: the model is initialized and trained on the bundled Food.com training KG.
+
 The triple score is the negative translation distance:
 
 `s(h,r,t) = -||e_h + e_r - e_t||_1`
 
-Entity embeddings are normalized to unit L2 length before each update. Training uses SGD, one uniformly corrupted head or tail per positive KG triple, rejects negatives already in the training KG, and uses TransE's margin-ranking objective.
+The distance can be L1 or L2. PyKEEN normalizes entity embeddings through TransE's built-in constraint after optimizer updates. PyKEEN's `BasicNegativeSampler` draws one corrupted head or tail per positive triple and filters known training triples. The project keeps an experiment loop so M2 can add its safety loss; the TransE model, KG margin loss, and negative sampler are library components.
 
-**M1 — TransE baseline** uses only the TransE margin loss:
+**M1 — TransE baseline** uses only PyKEEN's margin-ranking loss:
 
 `L_M1 = mean(max(0, margin + d_positive - d_negative))`
 
-**M2 — Safety-aware TransE** adds a safety ranking loss:
+**M2 — Safety-aware TransE** uses the same PyKEEN TransE model, margin-ranking loss, and negative sampler, then adds the project-specific safety ranking loss:
 
 `L_M2 = L_TransE + lambda_safe * mean(max(0, delta + s_unsafe - s_safe))`
 
 The same selected health scenario and validation checkpoint-selection metric are used for M1 and M2. M1 has no safety term in its training loss. M2 learns from SAFE/UNSAFE recipe pairs. At final evaluation M1 ranks without filtering; M2 removes UNSAFE and UNKNOWN recipes after scoring and returns fewer than K if there are not enough SAFE recipes.
+
+Because PyKEEN changes the model implementation and checkpoint format, train both models again in a new run folder. Checkpoints made by the previous hand-coded TransE implementation cannot be loaded by this version.
 
 ## Evaluation
 
@@ -48,7 +54,7 @@ The evaluator reports metrics at K=5, 10, and 20: Safety@K, SafetyAmongReturned,
 
 P-NDCG uses gain `2^relevance - 1` for SAFE recipes and `2^(-P) - 1` for non-SAFE recipes. `P` is the nominal penalty; `2^(-P)-1` is the actual negative gain. The evaluator reports P-NDCG for `P = 1, 3, 4, 5, 10`; charts and example comparisons use `P = 4`. The ideal DCG uses SAFE relevant recipes from the same candidate set. A zero ideal DCG produces undefined P-NDCG, and negative scores are not clipped. Changing `P` only changes evaluation, so existing checkpoints can be reused without retraining.
 
-The validation split has item IDs but no star ratings, so checkpoint selection uses binary safe-conditioned NDCG@10. Test metrics use the held-out 4/5-star ratings. Unobserved recipes used for negative sampling are training-time negatives, not confirmed dislikes.
+The validation split has item IDs but no star ratings, so checkpoint selection uses binary preference NDCG@10: every held-out validation interaction is relevant, and no safety labels or safety filter are used. This same validation metric selects checkpoints for M1 and M2. M1 does not build safety labels or safety pairs during training; M2 uses them only for its safety loss. Test metrics use held-out 4/5-star ratings and apply the configured inference policy. Unobserved recipes used for negative sampling are training-time negatives, not confirmed dislikes.
 
 ## Run in Colab
 
@@ -71,7 +77,7 @@ ROOT = '/content/Nutrition-Recommendation'
 OUTPUT_ROOT = Path('/content/drive/MyDrive/safety_aware_food_recommendation')
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 HEALTH_CONDITION = 'hypertension'
-RUN = str(OUTPUT_ROOT / 'runs' / 'transe_hypertension')
+RUN = str(OUTPUT_ROOT / 'runs' / 'transe_hypertension_pref_ndcg')
 ```
 
 Install the dependencies from the cloned repository:
@@ -79,6 +85,8 @@ Install the dependencies from the cloned repository:
 ```bash
 !pip install -q -r "$ROOT/requirements.txt"
 ```
+
+The Colab runtime must use Python 3.11 or newer for this PyKEEN version.
 
 Train M1 and M2 separately with the same `HEALTH_CONDITION` and `RUN` path:
 

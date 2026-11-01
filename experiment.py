@@ -11,20 +11,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import pykeen
+from pykeen.sampling import BasicNegativeSampler
 from safety_aware import (SafetyStatus, StatusLookup, assess_safety, dcg,
                           experiment_arms, parse_profile_conditions, prepare_metric_reference, safe_ndcg)
 
 HERE = Path(__file__).resolve().parent
 ROOT_DEFAULT = HERE
-# The 2026-10-31 Colab run stored this pre-evaluation-fix source hash. That
-# revision differs only in the nested relevance lookup fixed below.
-LEGACY_EVALUATION_FIX_SOURCE_HASH = "b2d9e17270d6dbfc8ebdc4a16a938a34c0d216916c706c2208246efdba1fd411"
-# Checkpoints trained by the immediately preceding Git revision can be reused
-# after this evaluation-only P sweep change.
-PRE_P4_EVALUATION_SOURCE_HASH = "9527ec7dbf3c14962fa663e13d7506cbb9ecf8f077cfd1a26ba66e9d8ceb3881"
 sys.path.insert(0, str(ROOT_DEFAULT / "latest version LightGCN_PathSim"))
 from dataloader import Dataset, read_split
-from transe_model import TransERecommender, transe_margin_loss
+from transe_model import TransERecommender
 
 
 def seed_all(seed):
@@ -82,41 +78,6 @@ def load_kg(path, n_users, n_items, train, val, test):
         "recipe_entity_ids": np.asarray([entity2id[x] for x in required_recipes], dtype=np.int64),
         "interacted_relation_id": relation2id["INTERACTED"],
     }
-
-
-class KnownTripleSampler:
-    """Uniformly corrupt one TransE triple while rejecting known KG facts."""
-
-    def __init__(self, triples, n_entities, n_relations, seed):
-        self.n_entities = int(n_entities)
-        self.n_relations = int(n_relations)
-        self.rng = np.random.default_rng(seed)
-        self.known_codes = np.unique(self._encode(triples[:, 0], triples[:, 1], triples[:, 2]))
-
-    def _encode(self, heads, relations, tails):
-        return (heads * self.n_relations + relations) * self.n_entities + tails
-
-    def sample(self, batch):
-        if not len(batch):
-            raise ValueError("Cannot sample negatives for an empty triple batch.")
-        negatives = batch.copy()
-        corrupt_head = self.rng.random(len(batch)) < 0.5
-        candidates = self.rng.integers(0, self.n_entities, size=len(batch), dtype=np.int64)
-        negatives[corrupt_head, 0] = candidates[corrupt_head]
-        negatives[~corrupt_head, 2] = candidates[~corrupt_head]
-        for _ in range(1000):
-            codes = self._encode(negatives[:, 0], negatives[:, 1], negatives[:, 2])
-            positions = np.searchsorted(self.known_codes, codes)
-            safe_positions = np.minimum(positions, len(self.known_codes) - 1)
-            invalid = ((positions < len(self.known_codes)) &
-                       (self.known_codes[safe_positions] == codes))
-            if not invalid.any():
-                return negatives
-            rows = np.flatnonzero(invalid)
-            replacements = self.rng.integers(0, self.n_entities, size=len(rows), dtype=np.int64)
-            negatives[rows[corrupt_head[rows]], 0] = replacements[corrupt_head[rows]]
-            negatives[rows[~corrupt_head[rows]], 2] = replacements[~corrupt_head[rows]]
-        raise RuntimeError("Could not sample corrupted TransE triples.")
 
 
 def load_inputs(root):
@@ -218,11 +179,11 @@ def training_safety_pools(dataset, user_keys, vectors, raw_train):
     return safe_positive, unsafe, np.asarray(safety_users, dtype=np.int64)
 
 
-def build_model(kg, embedding, distance="l1"):
+def build_model(kg, embedding, distance="l1", margin=1.0, seed=2020):
     return TransERecommender(
-        len(kg["entity2id"]), len(kg["relation2id"]), embedding,
+        kg["triples"], kg["entity2id"], kg["relation2id"], embedding,
         kg["user_entity_ids"], kg["recipe_entity_ids"],
-        kg["interacted_relation_id"], distance=distance)
+        kg["interacted_relation_id"], distance=distance, margin=margin, seed=seed)
 
 
 def pair_scores(model, user_ids, item_ids):
@@ -233,17 +194,16 @@ def score_user_batch(model, user_ids, item_chunk_size=1024):
     return model.score_all(user_ids, item_chunk_size=item_chunk_size)
 
 
-def validation_score(model, dataset, val, raw_train, user_keys, vectors, k=10):
-    """Binary safe-conditioned validation NDCG under the run-wide disease scenario."""
+def validation_score(model, dataset, val, raw_train, k=10):
+    """Binary preference NDCG on validation positives, without safety filtering."""
     active, relevant_by_user = [], {}
     for user, heldout in val.items():
-        states = status_vector(user_keys, vectors, user)
-        relevant = [item for item in heldout if states[item] == SafetyStatus.SAFE.value]
+        relevant = set(map(int, heldout))
         if relevant:
             active.append(user)
-            relevant_by_user[user] = set(relevant)
+            relevant_by_user[user] = relevant
     if not active:
-        raise ValueError("Validation has no SAFE positive under this health scenario; cannot select checkpoint.")
+        raise ValueError("Validation has no positive interactions; cannot select checkpoint.")
     model.eval()
     values_by_user = []
     with torch.no_grad():
@@ -252,10 +212,9 @@ def validation_score(model, dataset, val, raw_train, user_keys, vectors, k=10):
             ids = torch.as_tensor(user_batch, dtype=torch.long, device=dataset.device)
             score_batch = score_user_batch(model, ids).cpu().numpy()
             for row, user in enumerate(user_batch):
-                states = status_vector(user_keys, vectors, user)
                 seen = np.zeros(dataset.m_items, dtype=bool)
                 seen[raw_train.get(user, [])] = True
-                candidates = np.flatnonzero((states == SafetyStatus.SAFE.value) & ~seen)
+                candidates = np.flatnonzero(~seen)
                 if not len(candidates):
                     continue
                 scores = score_batch[row, candidates]
@@ -277,7 +236,8 @@ def validation_score(model, dataset, val, raw_train, user_keys, vectors, k=10):
 
 def input_hashes(root, paths):
     sources = [root / "latest version LightGCN_PathSim/dataloader.py",
-               HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py"]
+               HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py",
+               HERE / "requirements.txt"]
     return {str(p.relative_to(root)) if p.is_relative_to(root) else str(p): digest(p)
             for p in paths + sources}
 
@@ -285,19 +245,25 @@ def train(args):
     (root, metadata, rules, _, _, raw_train, val, _, paths, kg) = load_inputs(args.root)
     n_users = max(raw_train) + 1
     conditions, user_conditions = make_health_scenario(args.health_condition, rules, n_users)
-    user_keys, vectors = build_safety_index(metadata, rules, user_conditions, n_users)
-    checkpoint_selector = "validation safe-conditioned NDCG@10"
+    checkpoint_selector = "validation preference NDCG@10 (binary, no safety filtering)"
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(val)
-    safe_positive, unsafe, safety_users = training_safety_pools(
-        dataset, user_keys, vectors, raw_train)
-    if args.model == "m2" and not len(safety_users):
-        raise ValueError("M2 needs safe training interactions and unsafe recipe candidates under this health scenario.")
+    if args.model == "m2":
+        user_keys, vectors = build_safety_index(metadata, rules, user_conditions, n_users)
+        safe_positive, unsafe, safety_users = training_safety_pools(
+            dataset, user_keys, vectors, raw_train)
+        if not len(safety_users):
+            raise ValueError("M2 needs safe training interactions and unsafe recipe candidates under this health scenario.")
+    else:
+        safe_positive, unsafe = {}, {}
+        safety_users = np.empty(0, dtype=np.int64)
     seed_all(args.seed)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {"architecture": "TransE", "training_objective": "margin_ranking",
+    manifest = {"architecture": "PyKEEN TransE", "pykeen_version": pykeen.__version__,
+                "training_objective": "PyKEEN MarginRankingLoss with sLCWA negatives",
+                "negative_sampler": "PyKEEN BasicNegativeSampler (filtered, head/tail)",
                 "health_condition": conditions,
                 "distance": args.distance, "margin": args.margin,
                 "embedding": args.embedding, "entity_count": len(kg["entity2id"]),
@@ -314,19 +280,28 @@ def train(args):
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     out = run_dir / args.model
     out.mkdir(exist_ok=False)
-    model_config = {"model": args.model, "architecture": "TransE",
-                    "training_objective": "TransE margin ranking loss",
+    model_config = {"model": args.model, "architecture": "PyKEEN TransE",
+                    "implementation": "pykeen.models.TransE",
+                    "pykeen_version": pykeen.__version__,
+                    "training_objective": ("PyKEEN MarginRankingLoss" if args.model == "m1"
+                        else "PyKEEN MarginRankingLoss + project safety hinge loss"),
                     "health_condition": conditions,
                     "distance": args.distance, "margin": args.margin,
                     "lambda_safe": args.lambda_safe if args.model == "m2" else 0.,
                     "delta": args.delta if args.model == "m2" else 0.}
     (out / "training_config.json").write_text(json.dumps(model_config, indent=2), encoding="utf-8")
-    model = build_model(kg, args.embedding, args.distance).to(device)
+    model = build_model(kg, args.embedding, args.distance, args.margin, args.seed).to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
     safety_rng = np.random.default_rng(args.seed + 1)
-    triple_sampler = KnownTripleSampler(
-        kg["triples"], len(kg["entity2id"]), len(kg["relation2id"]), args.seed)
+    triple_sampler = BasicNegativeSampler(
+        mapped_triples=torch.as_tensor(kg["triples"], dtype=torch.long),
+        num_entities=len(kg["entity2id"]),
+        num_relations=len(kg["relation2id"]),
+        num_negs_per_pos=1,
+        filtered=True,
+        corruption_scheme=("head", "tail"),
+    ).to(device)
     history, best, best_epoch, stale = [], -float("inf"), 0, 0
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -335,13 +310,29 @@ def train(args):
         for start in range(0, len(order), args.batch_size):
             indices = order[start:start + args.batch_size]
             batch = kg["triples"][indices]
-            negative_batch = triple_sampler.sample(batch)
             as_tensor = lambda x: torch.as_tensor(x, dtype=torch.long, device=device)
-            positive_tensor, negative_tensor = as_tensor(batch), as_tensor(negative_batch)
-            model.normalize_entities()
-            positive_scores = model.score_triples(*positive_tensor.unbind(dim=1))
-            negative_scores = model.score_triples(*negative_tensor.unbind(dim=1))
-            kg_loss = transe_margin_loss(positive_scores, negative_scores, args.margin)
+            positive_tensor = as_tensor(batch)
+            negative_tensor, valid_negative_mask = triple_sampler.sample(positive_tensor)
+            negative_tensor = negative_tensor.to(device)
+            positive_scores = model.score_triples(*positive_tensor.unbind(dim=1)).unsqueeze(-1)
+            if valid_negative_mask is None:
+                negative_scores = model.score_triples(
+                    *negative_tensor.reshape(-1, 3).unbind(dim=1)
+                ).reshape(len(batch), -1)
+                kg_loss = model.kge.loss.process_slcwa_scores(
+                    positive_scores=positive_scores, negative_scores=negative_scores)
+            else:
+                valid_negative_mask = valid_negative_mask.to(device)
+                if not valid_negative_mask.any():
+                    continue
+                negative_tensor = negative_tensor[valid_negative_mask]
+                negative_scores = model.score_triples(
+                    *negative_tensor.unbind(dim=1))
+                kg_loss = model.kge.loss.process_slcwa_scores(
+                    positive_scores=positive_scores,
+                    negative_scores=negative_scores,
+                    batch_filter=valid_negative_mask,
+                )
             safe_loss = torch.zeros((), device=device)
             safety_pairs = 0
             if args.model == "m2":
@@ -364,19 +355,21 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             total.backward()
             optimizer.step()
+            model.post_parameter_update()
             n = len(batch)
             sums["transe_loss"] += float(kg_loss.detach()) * n
             sums["safety_loss"] += float(safe_loss.detach()) * safety_pairs
             safety_count += safety_pairs
             sums["total_loss"] += float(total.detach()) * n
             count += n
-        model.normalize_entities()
+        if count == 0:
+            raise ValueError("PyKEEN filtered sampler produced no valid negative triples in this epoch.")
         row = {"epoch": epoch, "transe_loss": sums["transe_loss"] / count,
                "safety_loss": sums["safety_loss"] / safety_count if safety_count else 0.0,
                "total_loss": sums["total_loss"] / count}
-        row["validation_safe_ndcg_at_10"] = validation_score(
-            model, dataset, val, raw_train, user_keys, vectors)
-        selection_score = row["validation_safe_ndcg_at_10"]
+        row["validation_ndcg_at_10"] = validation_score(
+            model, dataset, val, raw_train)
+        selection_score = row["validation_ndcg_at_10"]
         history.append(row)
         if selection_score > best:
             best, best_epoch, stale = selection_score, epoch, 0
@@ -393,12 +386,13 @@ def train(args):
     (out / "training_summary.json").write_text(json.dumps({
         "best_epoch": best_epoch, "best_validation_score": best,
         "checkpoint_selection_metric": manifest["checkpoint_selector"],
-        "best_validation_safe_ndcg_at_10": best,
+        "best_validation_ndcg_at_10": best,
         "epochs_completed": len(history), "health_condition": conditions,
         "scenario_users": n_users,
         "kg_triples": int(len(kg["triples"])),
         "training_users_with_safety_pairs": int(len(safety_users)), "device": str(device),
-        "architecture": "TransE", "training_objective": "margin_ranking"}, indent=2),
+        "architecture": "PyKEEN TransE", "pykeen_version": pykeen.__version__,
+        "training_objective": model_config["training_objective"]}, indent=2),
         encoding="utf-8")
     print(f"Saved {args.model.upper()} checkpoint at epoch {best_epoch}: {out}")
 
@@ -444,18 +438,18 @@ def evaluate(args):
     current_hashes = input_hashes(root, paths)
     changed_hashes = [name for name in set(expected_hashes) | set(current_hashes)
                       if expected_hashes.get(name) != current_hashes.get(name)]
-    # Permit the evaluation-only relevance lookup fix for checkpoints trained
-    # by the immediately preceding Colab revision. Data and model-source hashes
-    # must still match exactly.
-    if changed_hashes and not (
-            changed_hashes == ["experiment.py"] and
-            expected_hashes.get("experiment.py") in {
-                LEGACY_EVALUATION_FIX_SOURCE_HASH,
-                PRE_P4_EVALUATION_SOURCE_HASH,
-            }):
-        raise ValueError("Evaluation data/code hashes differ from training.")
+    if changed_hashes:
+        raise ValueError(
+            "Evaluation data/code/dependency hashes differ from training. "
+            "For the PyKEEN TransE implementation, train new checkpoints in a fresh run folder."
+        )
     if manifest.get("health_condition") != conditions:
         raise ValueError("Evaluation health condition differs from training. Use the same --health-condition.")
+    if manifest.get("pykeen_version") != pykeen.__version__:
+        raise ValueError(
+            f"Checkpoint was trained with PyKEEN {manifest.get('pykeen_version')}; "
+            f"the current runtime has {pykeen.__version__}. Install the pinned requirements."
+        )
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(test)
@@ -488,7 +482,9 @@ def evaluate(args):
         if model_name not in score_cache:
             checkpoint = torch.load(run_dir / model_name / "best_checkpoint.pt",
                                     map_location=device, weights_only=False)
-            model = build_model(kg, manifest["embedding"], manifest["distance"]).to(device)
+            model = build_model(
+                kg, manifest["embedding"], manifest["distance"],
+                manifest["margin"], manifest["seed"]).to(device)
             model.load_state_dict(checkpoint["state_dict"])
             score_cache[model_name] = score_model(model, dataset)
         scores = score_cache[model_name]
@@ -587,7 +583,7 @@ def comparison_examples(rows, folder):
 
 
 def sweep(args):
-    """Sweep lambda/delta and choose only by validation safe-conditioned NDCG."""
+    """Sweep lambda/delta, selecting checkpoints by preference-only validation NDCG."""
     out = Path(args.output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     records = []
@@ -599,9 +595,9 @@ def sweep(args):
             train(one)
             summary = json.loads((run / "m2/training_summary.json").read_text(encoding="utf-8"))
             records.append({"lambda_safe": lam, "delta": delta,
-                "validation_safe_ndcg_at_10": summary["best_validation_safe_ndcg_at_10"],
+                "validation_ndcg_at_10": summary["best_validation_ndcg_at_10"],
                 "best_epoch": summary["best_epoch"], "run_dir": str(run)})
-    result = pd.DataFrame(records).sort_values("validation_safe_ndcg_at_10", ascending=False)
+    result = pd.DataFrame(records).sort_values("validation_ndcg_at_10", ascending=False)
     result.to_csv(out / "validation_sweep.csv", index=False)
     print(result.to_string(index=False))
 

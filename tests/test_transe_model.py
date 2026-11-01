@@ -2,63 +2,60 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
+from pykeen.losses import MarginRankingLoss
+from pykeen.models import TransE
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from transe_model import TransERecommender, transe_margin_loss
+from transe_model import TransERecommender
 
 
 class TransERecommenderTests(unittest.TestCase):
     def make_model(self):
+        triples = np.asarray([[0, 0, 1], [0, 0, 2]], dtype=np.int64)
         return TransERecommender(
-            n_entities=3, n_relations=1, embedding_dim=2,
-            user_entity_ids=[0], recipe_entity_ids=[1, 2],
-            interacted_relation_id=0, distance="l1")
+            triples=triples,
+            entity2id={"user": 0, "recipe_a": 1, "recipe_b": 2},
+            relation2id={"INTERACTED": 0},
+            embedding_dim=4,
+            user_entity_ids=[0],
+            recipe_entity_ids=[1, 2],
+            interacted_relation_id=0,
+            distance="l1",
+            margin=1.0,
+            seed=123,
+        )
 
-    def test_score_is_negative_l1_translation_distance(self):
+    def test_uses_pykeen_transe_and_margin_ranking_loss(self):
         model = self.make_model()
-        with torch.no_grad():
-            model.entity_embedding.weight.copy_(torch.tensor([
-                [1.0, -1.0],  # user 0
-                [0.0, 0.0],   # recipe 0
-                [1.0, 0.0],   # recipe 1
-            ]))
-            model.relation_embedding.weight.copy_(torch.tensor([[0.5, 0.5]]))
-        score = model.score_pairs(torch.tensor([0]), torch.tensor([0]))
-        self.assertAlmostEqual(float(score.item()), -2.0)
-        self.assertAlmostEqual(float(model.score_pairs(torch.tensor([0]), torch.tensor([1])).item()), -1.0)
+        self.assertIsInstance(model.kge, TransE)
+        self.assertIsInstance(model.kge.loss, MarginRankingLoss)
 
-    def test_score_all_matches_pair_scoring_and_keeps_item_order(self):
-        model = TransERecommender(
-            n_entities=7, n_relations=2, embedding_dim=4,
-            user_entity_ids=[4, 0], recipe_entity_ids=[5, 2, 6],
-            interacted_relation_id=1)
-        users = torch.tensor([1, 0])
-        actual = model.score_all(users, item_chunk_size=2)
-        expected = torch.stack([
-            torch.stack([model.score_pairs(users[row:row + 1], torch.tensor([item])).squeeze(0)
-                         for item in range(3)])
-            for row in range(len(users))
-        ])
+    def test_triple_scoring_delegates_to_pykeen(self):
+        model = self.make_model()
+        triples = torch.tensor([[0, 0, 1], [0, 0, 2]], dtype=torch.long)
+        actual = model.score_triples(*triples.unbind(dim=1))
+        expected = model.kge.score_hrt(triples).squeeze(-1)
         torch.testing.assert_close(actual, expected)
 
-    def test_margin_loss_matches_trans_e_hinge_objective(self):
-        positive = torch.tensor([-1.0, -0.25], requires_grad=True)
-        negative = torch.tensor([-1.5, -2.0], requires_grad=True)
-        loss = transe_margin_loss(positive, negative, margin=1.0)
-        # [1 - s_positive + s_negative]_+ gives [0.5, 0.0], averaged.
-        self.assertAlmostEqual(float(loss.item()), 0.25)
-        loss.backward()
-        self.assertTrue(torch.isfinite(positive.grad).all())
-        self.assertTrue(torch.isfinite(negative.grad).all())
-
-    def test_entity_normalization_enforces_unit_l2_norm(self):
+    def test_score_all_matches_pair_scoring_and_preserves_item_order(self):
         model = self.make_model()
-        with torch.no_grad():
-            model.entity_embedding.weight.fill_(3.0)
-        model.normalize_entities()
-        norms = torch.linalg.vector_norm(model.entity_embedding.weight, ord=2, dim=1)
-        torch.testing.assert_close(norms, torch.ones_like(norms))
+        users = torch.tensor([0])
+        actual = model.score_all(users, item_chunk_size=1)
+        expected = torch.stack([
+            model.score_pairs(users, torch.tensor([item])).squeeze(0)
+            for item in range(2)
+        ]).unsqueeze(0)
+        torch.testing.assert_close(actual, expected)
+
+    def test_slcwa_margin_loss_comes_from_pykeen(self):
+        model = self.make_model()
+        positive = torch.tensor([[-1.0], [-0.25]])
+        negative = torch.tensor([[-1.5], [-2.0]])
+        loss = model.kge.loss.process_slcwa_scores(positive, negative)
+        expected = torch.relu(1.0 - positive + negative).mean()
+        torch.testing.assert_close(loss, expected)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 torch>=2.5
+pykeen==1.11.1
 numpy
 pandas
 scipy
