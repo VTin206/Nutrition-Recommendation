@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import hashlib
+from importlib.metadata import version as package_version
 import json
 import math
 import random
@@ -11,7 +12,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-import pykeen
 from pykeen.sampling import BasicNegativeSampler
 from safety_aware import (SafetyStatus, StatusLookup, assess_safety, dcg,
                           experiment_arms, parse_profile_conditions, prepare_metric_reference, safe_ndcg)
@@ -21,6 +21,8 @@ ROOT_DEFAULT = HERE
 sys.path.insert(0, str(ROOT_DEFAULT / "latest version LightGCN_PathSim"))
 from dataloader import Dataset, read_split
 from transe_model import TransERecommender
+
+PYKEEN_VERSION = package_version("pykeen")
 
 
 def seed_all(seed):
@@ -261,7 +263,7 @@ def train(args):
     seed_all(args.seed)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {"architecture": "PyKEEN TransE", "pykeen_version": pykeen.__version__,
+    manifest = {"architecture": "PyKEEN TransE", "pykeen_version": PYKEEN_VERSION,
                 "training_objective": "PyKEEN MarginRankingLoss with sLCWA negatives",
                 "negative_sampler": "PyKEEN BasicNegativeSampler (filtered, head/tail)",
                 "health_condition": conditions,
@@ -282,7 +284,7 @@ def train(args):
     out.mkdir(exist_ok=False)
     model_config = {"model": args.model, "architecture": "PyKEEN TransE",
                     "implementation": "pykeen.models.TransE",
-                    "pykeen_version": pykeen.__version__,
+                    "pykeen_version": PYKEEN_VERSION,
                     "training_objective": ("PyKEEN MarginRankingLoss" if args.model == "m1"
                         else "PyKEEN MarginRankingLoss + project safety hinge loss"),
                     "health_condition": conditions,
@@ -391,7 +393,7 @@ def train(args):
         "scenario_users": n_users,
         "kg_triples": int(len(kg["triples"])),
         "training_users_with_safety_pairs": int(len(safety_users)), "device": str(device),
-        "architecture": "PyKEEN TransE", "pykeen_version": pykeen.__version__,
+        "architecture": "PyKEEN TransE", "pykeen_version": PYKEEN_VERSION,
         "training_objective": model_config["training_objective"]}, indent=2),
         encoding="utf-8")
     print(f"Saved {args.model.upper()} checkpoint at epoch {best_epoch}: {out}")
@@ -445,10 +447,10 @@ def evaluate(args):
         )
     if manifest.get("health_condition") != conditions:
         raise ValueError("Evaluation health condition differs from training. Use the same --health-condition.")
-    if manifest.get("pykeen_version") != pykeen.__version__:
+    if manifest.get("pykeen_version") != PYKEEN_VERSION:
         raise ValueError(
             f"Checkpoint was trained with PyKEEN {manifest.get('pykeen_version')}; "
-            f"the current runtime has {pykeen.__version__}. Install the pinned requirements."
+            f"the current runtime has {PYKEEN_VERSION}. Install the pinned requirements."
         )
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
