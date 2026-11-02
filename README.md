@@ -1,6 +1,6 @@
-# Food.com TransE Safety Recommendation Experiment
+# Food.com Safety Recommendation Experiment: TransE and RotatE
 
-This folder is intended to be uploaded to Google Drive and run in Colab. It contains the fixed Food.com interaction splits, training knowledge graph, recipe nutrition metadata, configurable health rules, and TransE training/evaluation code. The dataset has no patient diagnosis labels.
+This folder is intended to be uploaded to Google Drive and run in Colab. It contains the fixed Food.com interaction splits, training knowledge graph, recipe nutrition metadata, configurable health rules, and TransE/RotatE training and evaluation code. The dataset has no patient diagnosis labels.
 
 ## Health-condition setup
 
@@ -24,7 +24,7 @@ The old per-user profile template is no longer needed and has been removed. You 
 
 - `kg/foodcom_kg_triples.tsv` contains user–recipe training interactions and recipe-side relations. Its `INTERACTED` triples match the frozen training split; validation and test interactions are excluded.
 - The CSV interaction files provide preference labels for final test evaluation. Rating 4 maps to relevance 1 and rating 5 maps to relevance 2.
-- This experiment trains **TransE only**. The bundled LightGCN files are retained for the shared data loader.
+- The same M1/M2 experiment can run either **TransE** or **RotatE**. The bundled LightGCN files are retained for the shared data loader.
 
 ## TransE implementation and objectives
 
@@ -47,6 +47,14 @@ The distance can be L1 or L2. PyKEEN normalizes entity embeddings through TransE
 The same selected health scenario and validation checkpoint-selection metric are used for M1 and M2. M1 has no safety term in its training loss. M2 learns from SAFE/UNSAFE recipe pairs. At final evaluation M1 ranks without filtering; M2 removes UNSAFE and UNKNOWN recipes after scoring and returns fewer than K if there are not enough SAFE recipes.
 
 Because PyKEEN changes the model implementation and checkpoint format, train both models again in a new run folder. Checkpoints made by the previous hand-coded TransE implementation cannot be loaded by this version.
+
+## RotatE from the original repository
+
+RotatE is loaded from the original [KnowledgeGraphEmbedding repository](https://github.com/DeepGraphLearning/KnowledgeGraphEmbedding), pinned to commit `2e440e0f9c687314d5ff67ead68ce985dc446e3a`. The original `KGEModel`, `TrainDataset`, and `BidirectionalOneShotIterator` files are bundled under `vendor/KnowledgeGraphEmbedding/` with their MIT license. The adapter only maps Food.com users and recipes to KG triples; it does not reimplement RotatE scoring. The bundled source matches the original repository at the pinned commit.
+
+RotatE M1 uses the original model's `train_step`, including its log-sigmoid objective, filtered head/tail negative sampling, frequency subsampling, and self-adversarial negative weights. RotatE M2 uses the same original RotatE model and sampler, then adds the project safety hinge loss in the same optimizer step. The adapter's `--embedding` value is the original `hidden_dim`; the upstream model doubles entity embedding width internally for complex-valued entities. Defaults are gamma 12, 128 negatives, adversarial temperature 1, Adam, and learning rate 0.0001. The safety loss and inference-time hard filter are project-specific additions.
+
+Train M1 and M2 with the same architecture and run folder. Use a separate new folder for RotatE and retrain both arms; TransE and RotatE checkpoints are not interchangeable. Compare M1 against M2 within the same architecture. A direct TransE-versus-RotatE comparison also changes the base training objective and sampler, so report the architecture and training configuration.
 
 ## Evaluation
 
@@ -86,7 +94,7 @@ Install the dependencies from the cloned repository:
 !pip install -q -r "$ROOT/requirements.txt"
 ```
 
-The Colab runtime must use Python 3.11 or newer for this PyKEEN version.
+The Colab runtime must use Python 3.11 or newer for the pinned PyKEEN version. RotatE source is included in this folder, so Colab does not need to clone another repository at runtime.
 
 Train M1 and M2 separately with the same `HEALTH_CONDITION` and `RUN` path:
 
@@ -99,6 +107,18 @@ Then evaluate both models:
 
 ```bash
 !python "$ROOT/experiment.py" evaluate --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN"
+```
+
+To run RotatE, set a separate output folder and pass `--architecture rotate` to both training cells. Train M1 and M2 separately, then evaluate; the evaluator reads the architecture from the run manifest:
+
+```python
+RUN_ROTATE = str(OUTPUT_ROOT / 'runs' / 'rotate_hypertension')
+```
+
+```bash
+!python "$ROOT/experiment.py" train --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN_ROTATE" --architecture rotate --model m1 --embedding 64 --gamma 12 --negative-sample-size 128 --adversarial-temperature 1 --epochs 300 --patience 20 --seed 2020
+!python "$ROOT/experiment.py" train --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN_ROTATE" --architecture rotate --model m2 --embedding 64 --gamma 12 --negative-sample-size 128 --adversarial-temperature 1 --lambda-safe 0.5 --delta 1.0 --epochs 300 --patience 20 --seed 2020
+!python "$ROOT/experiment.py" evaluate --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN_ROTATE"
 ```
 
 The condition used for evaluation must match the condition used in training. For another disease, change both `HEALTH_CONDITION` and `RUN` (for example `diabetes` and `transe_diabetes`) and train both models again. This keeps different condition scenarios in separate result folders. Use a new run folder if you train again; an existing run folder already contains checkpoints and a manifest.
