@@ -24,7 +24,7 @@ The old per-user profile template is no longer needed and has been removed. You 
 
 - `kg/foodcom_kg_triples.tsv` contains user–recipe training interactions and recipe-side relations. Its `INTERACTED` triples match the frozen training split; validation and test interactions are excluded.
 - The CSV interaction files provide preference labels for final test evaluation. Rating 4 maps to relevance 1 and rating 5 maps to relevance 2.
-- The same M1/M2 experiment can run either **TransE** or **RotatE**. The bundled LightGCN files are retained for the shared data loader.
+- The same M1/M2 experiment can run either **TransE** or **RotatE**. `foodcom_data.py` reads and validates the frozen interaction splits.
 
 ## TransE implementation and objectives
 

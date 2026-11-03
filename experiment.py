@@ -6,7 +6,6 @@ from importlib.metadata import version as package_version
 import json
 import math
 import random
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -20,8 +19,7 @@ from safety_aware import (SafetyStatus, StatusLookup, assess_safety, dcg,
 
 HERE = Path(__file__).resolve().parent
 ROOT_DEFAULT = HERE
-sys.path.insert(0, str(ROOT_DEFAULT / "latest version LightGCN_PathSim"))
-from dataloader import Dataset, read_split
+from foodcom_data import Dataset, read_split
 from transe_model import TransERecommender
 from rotate_model import (RotatERecommender, TrainDataset as RotateTrainDataset,
                           BidirectionalOneShotIterator as RotateIterator,
@@ -265,7 +263,7 @@ def validation_score(model, dataset, val, raw_train, k=10):
 
 
 def input_hashes(root, paths):
-    sources = [root / "latest version LightGCN_PathSim/dataloader.py",
+    sources = [HERE / "foodcom_data.py",
                HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py",
                HERE / "rotate_model.py", HERE / "requirements.txt",
                HERE / "vendor/KnowledgeGraphEmbedding/codes/model.py",
