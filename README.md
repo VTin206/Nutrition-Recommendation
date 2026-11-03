@@ -56,9 +56,15 @@ RotatE M1 uses the original model's `train_step`, including its log-sigmoid obje
 
 Train M1 and M2 with the same architecture and run folder. Use a separate new folder for RotatE and retrain both arms; TransE and RotatE checkpoints are not interchangeable. Compare M1 against M2 within the same architecture. A direct TransE-versus-RotatE comparison also changes the base training objective and sampler, so report the architecture and training configuration.
 
+## PathSim baselines
+
+PathSim is implemented locally from the symmetric meta-path formula in [Sun et al. (2011)](https://www.vldb.org/pvldb/vol4/p992-sun.pdf), using SciPy sparse matrices. No external PathSim repository or package is used. The evaluator compares two meta-paths: `User–Recipe–User` via `INTERACTED` and `Recipe–Ingredient–Recipe` via `HAS_INGREDIENT`. User interactions come only from the frozen training split. Recommendation scores are similarity-weighted sums of train interactions, and self-similarity is removed before scoring. Each ranking is evaluated before and after the same SAFE-only inference filter used by M2, so the filter's effect is reported separately.
+
+The current KG's `CONTAINS_NUTRIENT` relation connects every recipe to the same seven nutrient-type entities and does not encode numeric amounts, so it is excluded from PathSim. Nutrient-profile similarity should use numeric recipe metadata or explicitly documented nutrient bins. Evaluation saves the formula, meta-paths, and data-source policy in `pathsim_config.json`.
+
 ## Evaluation
 
-The evaluator reports only these metrics at K=10: Safety@K, Unsafe@1, Unknown@K, P-NDCG@K, NDCG@K, Precision@K, Recall@K, and RecommendationCoverage. The comparison table also identifies the health scenario, model, K, penalty, and number of evaluated users. Safety@K is undefined for users who receive fewer than 10 recipes. Unknown@K is the fraction of returned recipes whose safety status is UNKNOWN. RecommendationCoverage is the fraction of the recipe catalog recommended at least once; it measures item/catalog coverage, not the fraction of users reached. Recall@K is undefined when a user's relevant-item pool is empty.
+The evaluator reports these metrics at K=10: Safety@K, FillRate@K, Unsafe@1, Unknown@K, P-NDCG@K, NDCG@K, Precision@K, Recall@K, and RecommendationCoverage. The comparison table also identifies the health scenario, model, K, penalty, and number of evaluated users. Safety@K is undefined for users who receive fewer than 10 recipes; FillRate@K reports the fraction of the requested list returned. Unknown@K is the fraction of returned recipes whose safety status is UNKNOWN. RecommendationCoverage is the fraction of the recipe catalog recommended at least once; it measures item/catalog coverage, not the fraction of users reached. Recall@K is undefined when a user's relevant-item pool is empty.
 
 P-NDCG uses gain `2^relevance - 1` for SAFE recipes and `2^(-P) - 1` for non-SAFE recipes. `P` is the nominal penalty; `2^(-P)-1` is the actual negative gain. The evaluator reports P-NDCG only for `P = 5`; charts and example comparisons also use `P = 5`. The ideal DCG uses SAFE relevant recipes from the same candidate set. A zero ideal DCG produces undefined P-NDCG, and negative scores are not clipped. Changing `P` only changes evaluation, so existing checkpoints can be reused without retraining.
 
@@ -103,7 +109,7 @@ Train M1 and M2 separately with the same `HEALTH_CONDITION` and `RUN` path:
 !python "$ROOT/experiment.py" train --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN" --model m2 --embedding 64 --distance l1 --margin 1.0 --lambda-safe 0.5 --delta 1.0 --epochs 300 --patience 20 --seed 2020
 ```
 
-Then evaluate both models:
+Then evaluate M1, M2, and both PathSim baselines:
 
 ```bash
 !python "$ROOT/experiment.py" evaluate --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN"
@@ -133,7 +139,7 @@ Each run manifest records the selected health condition and hashes the inputs an
 
 ## Outputs
 
-Each model folder saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. Evaluation saves per-user and aggregate tables containing only the selected metrics, recommendation examples, and charts for those metrics.
+Each trained model folder saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. Evaluation also computes PathSim without a separate training step and saves `pathsim_config.json`, per-user and aggregate tables, recommendation examples, and metric charts.
 
 ## Tests
 

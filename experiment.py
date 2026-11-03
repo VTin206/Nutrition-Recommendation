@@ -1,4 +1,4 @@
-"""M1/M2 Food.com experiments with library-backed TransE and official RotatE."""
+"""Food.com experiments with TransE, official RotatE, and PathSim baselines."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -16,6 +16,7 @@ from pykeen.sampling import BasicNegativeSampler
 from torch.utils.data import DataLoader
 from safety_aware import (SafetyStatus, StatusLookup, assess_safety, dcg,
                           experiment_arms, parse_profile_conditions, prepare_metric_reference, safe_ndcg)
+from pathsim_model import PATHSIM_CONFIG, build_pathsim_scores
 
 HERE = Path(__file__).resolve().parent
 ROOT_DEFAULT = HERE
@@ -33,7 +34,7 @@ PRE_K10_EVALUATION_SOURCE_HASH = "a67e721f90d629cd2cd4f33414635ba7939c47a314312d
 # Restricting the reported metrics also changes evaluation output only.
 PRE_SELECTED_METRICS_SOURCE_HASH = "d0ce62b0bc6a10ea407993e052bd47327433f51db2f8a771b763595224c37c35"
 
-USER_METRICS = ["Safety@K", "Unsafe@1", "Unknown@K", "P-NDCG@K", "NDCG@K",
+USER_METRICS = ["Safety@K", "FillRate@K", "Unsafe@1", "Unknown@K", "P-NDCG@K", "NDCG@K",
                 "Precision@K", "Recall@K"]
 REPORTED_METRICS = [*USER_METRICS, "RecommendationCoverage"]
 
@@ -66,8 +67,10 @@ def load_kg(path, n_users, n_items, train, val, test):
     relations = sorted(set(frame["relation"]))
     entity2id = {name: idx for idx, name in enumerate(entities)}
     relation2id = {name: idx for idx, name in enumerate(relations)}
-    if "INTERACTED" not in relation2id:
-        raise ValueError("KG is missing the INTERACTED relation.")
+    missing_relations = [name for name in ("INTERACTED", "HAS_INGREDIENT")
+                         if name not in relation2id]
+    if missing_relations:
+        raise ValueError("KG is missing relations: " + ", ".join(missing_relations))
     triples = np.column_stack((frame["head"].map(entity2id),
                                frame["relation"].map(relation2id),
                                frame["tail"].map(entity2id))).astype(np.int64)
@@ -92,6 +95,7 @@ def load_kg(path, n_users, n_items, train, val, test):
         "user_entity_ids": np.asarray([entity2id[x] for x in required_users], dtype=np.int64),
         "recipe_entity_ids": np.asarray([entity2id[x] for x in required_recipes], dtype=np.int64),
         "interacted_relation_id": relation2id["INTERACTED"],
+        "has_ingredient_relation_id": relation2id["HAS_INGREDIENT"],
     }
 
 
@@ -265,7 +269,7 @@ def validation_score(model, dataset, val, raw_train, k=10):
 def input_hashes(root, paths):
     sources = [HERE / "foodcom_data.py",
                HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py",
-               HERE / "rotate_model.py", HERE / "requirements.txt",
+               HERE / "rotate_model.py", HERE / "pathsim_model.py", HERE / "requirements.txt",
                HERE / "vendor/KnowledgeGraphEmbedding/codes/model.py",
                HERE / "vendor/KnowledgeGraphEmbedding/codes/dataloader.py",
                HERE / "vendor/KnowledgeGraphEmbedding/UPSTREAM.md",
@@ -616,6 +620,12 @@ def evaluate(args):
     if not available_models:
         raise FileNotFoundError(f"No trained {manifest['architecture']} checkpoint found under {run_dir}.")
     arms = [arm for arm in arms if arm[1] in available_models]
+    arms.extend([
+        ("PathSim User", "pathsim_user", False),
+        ("PathSim User + SAFE filter", "pathsim_user", True),
+        ("PathSim Ingredient", "pathsim_ingredient", False),
+        ("PathSim Ingredient + SAFE filter", "pathsim_ingredient", True),
+    ])
     relevance = {}
     for row in test_frame.itertuples():
         if float(row.rating) >= 4.0:
@@ -635,14 +645,21 @@ def evaluate(args):
     examples, rows, score_cache = [], [], {}
     for label, model_name, hard_filter in arms:
         if model_name not in score_cache:
-            checkpoint = torch.load(run_dir / model_name / "best_checkpoint.pt",
-                                    map_location=device, weights_only=False)
-            model = build_experiment_model(
-                architecture, kg, manifest["embedding"], manifest.get("distance") or "l1",
-                manifest["margin"], manifest.get("gamma") or 12.0,
-                manifest["seed"]).to(device)
-            model.load_state_dict(checkpoint["state_dict"])
-            score_cache[model_name] = score_model(model, dataset)
+            if model_name.startswith("pathsim_"):
+                pathsim_scores, pathsim_data_counts = build_pathsim_scores(dataset, kg)
+                score_cache.update(pathsim_scores)
+                pathsim_config = {**PATHSIM_CONFIG, "data_counts": pathsim_data_counts}
+                (run_dir / "pathsim_config.json").write_text(
+                    json.dumps(pathsim_config, indent=2), encoding="utf-8")
+            else:
+                checkpoint = torch.load(run_dir / model_name / "best_checkpoint.pt",
+                                        map_location=device, weights_only=False)
+                model = build_experiment_model(
+                    architecture, kg, manifest["embedding"], manifest.get("distance") or "l1",
+                    manifest["margin"], manifest.get("gamma") or 12.0,
+                    manifest["seed"]).to(device)
+                model.load_state_dict(checkpoint["state_dict"])
+                score_cache[model_name] = score_model(model, dataset)
         scores = score_cache[model_name]
         for user in range(n_users):
             states, candidates, user_status, reference = contexts[user]
@@ -714,7 +731,8 @@ def plot_metrics(table, folder):
     except ImportError:
         print("matplotlib unavailable; saved comparison tables only.", flush=True)
         return
-    charts = [("Safety@K", "safety_at_k.png"), ("Unsafe@1", "unsafe_at_1.png"),
+    charts = [("Safety@K", "safety_at_k.png"), ("FillRate@K", "fill_rate_at_k.png"),
+        ("Unsafe@1", "unsafe_at_1.png"),
         ("Unknown@K", "unknown_at_k.png"), ("P-NDCG@K", "p_ndcg_at_k.png"),
         ("NDCG@K", "ndcg_at_k.png"), ("Precision@K", "precision_at_k.png"),
         ("Recall@K", "recall_at_k.png"),
