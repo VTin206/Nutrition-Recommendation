@@ -37,6 +37,12 @@ PRE_SELECTED_METRICS_SOURCE_HASH = "d0ce62b0bc6a10ea407993e052bd47327433f51db2f8
 USER_METRICS = ["Safety@K", "FillRate@K", "Unsafe@1", "Unknown@K", "P-NDCG@K", "NDCG@K",
                 "Precision@K", "Recall@K"]
 REPORTED_METRICS = [*USER_METRICS, "RecommendationCoverage"]
+PATHSIM_ARMS = [
+    ("PathSim User", "pathsim_user", False),
+    ("PathSim User + SAFE filter", "pathsim_user", True),
+    ("PathSim Ingredient", "pathsim_ingredient", False),
+    ("PathSim Ingredient + SAFE filter", "pathsim_ingredient", True),
+]
 
 
 def seed_all(seed):
@@ -573,59 +579,65 @@ def score_model(model, dataset):
     return torch.cat(chunks).numpy()
 
 def evaluate(args):
+    pathsim_only = getattr(args, "pathsim_only", False)
     (root, metadata, rules, _, test_frame, raw_train, val, test, paths, kg) = load_inputs(args.root)
     n_users = max(raw_train) + 1
     conditions, user_conditions = make_health_scenario(args.health_condition, rules, n_users)
     user_keys, vectors = build_safety_index(metadata, rules, user_conditions, n_users)
-    run_dir = Path(args.run_dir).resolve()
-    manifest_path = run_dir / "experiment.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Missing experiment manifest: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    expected_hashes = manifest["input_sha256"]
-    current_hashes = input_hashes(root, paths)
-    changed_hashes = [name for name in set(expected_hashes) | set(current_hashes)
-                      if expected_hashes.get(name) != current_hashes.get(name)]
-    evaluation_only_code_change = (
-        set(changed_hashes) == {"experiment.py"} and
-        expected_hashes.get("experiment.py") in {
-            PRE_P5_EVALUATION_SOURCE_HASH,
-            PRE_K10_EVALUATION_SOURCE_HASH,
-            PRE_SELECTED_METRICS_SOURCE_HASH,
-        }
-    )
-    if changed_hashes and not evaluation_only_code_change:
-        raise ValueError(
-            "Evaluation data/code/dependency hashes differ from training. "
-            "Train fresh checkpoints in a new run folder with the current implementation."
+    if pathsim_only:
+        run_dir = Path(args.output_dir).resolve()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        manifest = None
+        architecture = "pathsim"
+    else:
+        run_dir = Path(args.run_dir).resolve()
+        manifest_path = run_dir / "experiment.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Missing experiment manifest: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected_hashes = manifest["input_sha256"]
+        current_hashes = input_hashes(root, paths)
+        changed_hashes = [name for name in set(expected_hashes) | set(current_hashes)
+                          if expected_hashes.get(name) != current_hashes.get(name)]
+        evaluation_only_code_change = (
+            set(changed_hashes) == {"experiment.py"} and
+            expected_hashes.get("experiment.py") in {
+                PRE_P5_EVALUATION_SOURCE_HASH,
+                PRE_K10_EVALUATION_SOURCE_HASH,
+                PRE_SELECTED_METRICS_SOURCE_HASH,
+            }
         )
-    if manifest.get("health_condition") != conditions:
-        raise ValueError("Evaluation health condition differs from training. Use the same --health-condition.")
-    architecture = manifest.get("architecture_id", "transe")
-    if architecture == "transe" and manifest.get("pykeen_version") != PYKEEN_VERSION:
-        raise ValueError(
-            f"Checkpoint was trained with PyKEEN {manifest.get('pykeen_version')}; "
-            f"the current runtime has {PYKEEN_VERSION}. Install the pinned requirements."
-        )
-    if architecture == "rotate" and manifest.get("upstream_commit") != ROTATE_UPSTREAM_COMMIT:
-        raise ValueError("Checkpoint RotatE source commit differs from this package's pinned upstream source.")
+        if changed_hashes and not evaluation_only_code_change:
+            raise ValueError(
+                "Evaluation data/code/dependency hashes differ from training. "
+                "Train fresh checkpoints in a new run folder with the current implementation."
+            )
+        if manifest.get("health_condition") != conditions:
+            raise ValueError("Evaluation health condition differs from training. Use the same --health-condition.")
+        architecture = manifest.get("architecture_id", "transe")
+        if architecture == "transe" and manifest.get("pykeen_version") != PYKEEN_VERSION:
+            raise ValueError(
+                f"Checkpoint was trained with PyKEEN {manifest.get('pykeen_version')}; "
+                f"the current runtime has {PYKEEN_VERSION}. Install the pinned requirements."
+            )
+        if architecture == "rotate" and manifest.get("upstream_commit") != ROTATE_UPSTREAM_COMMIT:
+            raise ValueError("Checkpoint RotatE source commit differs from this package's pinned upstream source.")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(test)
-    arms = experiment_arms()
-    available_models = {
-        model_name for _, model_name, _ in arms
-        if (run_dir / model_name / "best_checkpoint.pt").is_file()
-    }
-    if not available_models:
-        raise FileNotFoundError(f"No trained {manifest['architecture']} checkpoint found under {run_dir}.")
-    arms = [arm for arm in arms if arm[1] in available_models]
-    arms.extend([
-        ("PathSim User", "pathsim_user", False),
-        ("PathSim User + SAFE filter", "pathsim_user", True),
-        ("PathSim Ingredient", "pathsim_ingredient", False),
-        ("PathSim Ingredient + SAFE filter", "pathsim_ingredient", True),
-    ])
+    if pathsim_only:
+        arms = PATHSIM_ARMS
+    else:
+        arms = experiment_arms()
+        available_models = {
+            model_name for _, model_name, _ in arms
+            if (run_dir / model_name / "best_checkpoint.pt").is_file()
+        }
+        if not available_models:
+            raise FileNotFoundError(f"No trained {manifest['architecture']} checkpoint found under {run_dir}.")
+        arms = [arm for arm in arms if arm[1] in available_models]
+        if args.include_pathsim:
+            arms.extend(PATHSIM_ARMS)
     relevance = {}
     for row in test_frame.itertuples():
         if float(row.rating) >= 4.0:
@@ -648,7 +660,12 @@ def evaluate(args):
             if model_name.startswith("pathsim_"):
                 pathsim_scores, pathsim_data_counts = build_pathsim_scores(dataset, kg)
                 score_cache.update(pathsim_scores)
-                pathsim_config = {**PATHSIM_CONFIG, "data_counts": pathsim_data_counts}
+                pathsim_config = {
+                    **PATHSIM_CONFIG,
+                    "health_condition": conditions,
+                    "data_counts": pathsim_data_counts,
+                    "input_sha256": input_hashes(root, paths),
+                }
                 (run_dir / "pathsim_config.json").write_text(
                     json.dumps(pathsim_config, indent=2), encoding="utf-8")
             else:
@@ -814,6 +831,14 @@ def main():
                     help="Must match the condition used for training")
     ev.add_argument("--run-dir", required=True)
     ev.add_argument("--device", default=None)
+    ev.add_argument("--include-pathsim", action="store_true",
+                    help="Also evaluate PathSim in this KGE run folder.")
+    ps = subs.add_parser("evaluate-pathsim")
+    ps.add_argument("--root", default=str(ROOT_DEFAULT))
+    ps.add_argument("--health-condition", required=True)
+    ps.add_argument("--output-dir", required=True,
+                    help="Separate output folder for PathSim-only evaluation.")
+    ps.add_argument("--device", default=None)
     sw = subs.add_parser("sweep")
     shared(sw)
     sw.add_argument("--output-dir", required=True)
@@ -831,6 +856,9 @@ def main():
     if args.command == "train":
         train(args)
     elif args.command == "evaluate":
+        evaluate(args)
+    elif args.command == "evaluate-pathsim":
+        args.pathsim_only = True
         evaluate(args)
     else:
         sweep(args)

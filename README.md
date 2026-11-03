@@ -58,7 +58,7 @@ Train M1 and M2 with the same architecture and run folder. Use a separate new fo
 
 ## PathSim baselines
 
-PathSim is implemented locally from the symmetric meta-path formula in [Sun et al. (2011)](https://www.vldb.org/pvldb/vol4/p992-sun.pdf), using SciPy sparse matrices. No external PathSim repository or package is used. The evaluator compares two meta-paths: `User–Recipe–User` via `INTERACTED` and `Recipe–Ingredient–Recipe` via `HAS_INGREDIENT`. User interactions come only from the frozen training split. Recommendation scores are similarity-weighted sums of train interactions, and self-similarity is removed before scoring. Each ranking is evaluated before and after the same SAFE-only inference filter used by M2, so the filter's effect is reported separately.
+PathSim is implemented locally from the symmetric meta-path formula in [Sun et al. (2011)](https://www.vldb.org/pvldb/vol4/p992-sun.pdf), using SciPy sparse matrices. No external PathSim repository or package is used. The standalone evaluator compares two meta-paths: `User–Recipe–User` via `INTERACTED` and `Recipe–Ingredient–Recipe` via `HAS_INGREDIENT`. User interactions come only from the frozen training split. Recommendation scores are similarity-weighted sums of train interactions, and self-similarity is removed before scoring. Each ranking is evaluated before and after the same SAFE-only inference filter used by M2, so the filter's effect is reported separately. PathSim has no training step or checkpoint; it can be evaluated without training a KGE model.
 
 The current KG's `CONTAINS_NUTRIENT` relation connects every recipe to the same seven nutrient-type entities and does not encode numeric amounts, so it is excluded from PathSim. Nutrient-profile similarity should use numeric recipe metadata or explicitly documented nutrient bins. Evaluation saves the formula, meta-paths, and data-source policy in `pathsim_config.json`.
 
@@ -109,11 +109,23 @@ Train M1 and M2 separately with the same `HEALTH_CONDITION` and `RUN` path:
 !python "$ROOT/experiment.py" train --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN" --model m2 --embedding 64 --distance l1 --margin 1.0 --lambda-safe 0.5 --delta 1.0 --epochs 300 --patience 20 --seed 2020
 ```
 
-Then evaluate M1, M2, and both PathSim baselines:
+Then evaluate M1 and M2:
 
 ```bash
 !python "$ROOT/experiment.py" evaluate --root "$ROOT" --health-condition "$HEALTH_CONDITION" --run-dir "$RUN"
 ```
+
+Evaluate PathSim in its own output folder for the same disease scenario:
+
+```python
+PATHSIM_RUN = str(OUTPUT_ROOT / 'runs' / f'pathsim_{HEALTH_CONDITION}')
+```
+
+```bash
+!python "$ROOT/experiment.py" evaluate-pathsim --root "$ROOT" --health-condition "$HEALTH_CONDITION" --output-dir "$PATHSIM_RUN"
+```
+
+Pass `--include-pathsim` to `evaluate` only when you want PathSim results written alongside the trained KGE model results.
 
 To run RotatE, set a separate output folder and pass `--architecture rotate` to both training cells. Train M1 and M2 separately, then evaluate; the evaluator reads the architecture from the run manifest:
 
@@ -139,7 +151,7 @@ Each run manifest records the selected health condition and hashes the inputs an
 
 ## Outputs
 
-Each trained model folder saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. Evaluation also computes PathSim without a separate training step and saves `pathsim_config.json`, per-user and aggregate tables, recommendation examples, and metric charts.
+Each trained model folder saves `best_checkpoint.pt`, `training_config.json`, `training_history.csv`, `loss_curves.png`, and `training_summary.json`. KGE evaluation saves per-user and aggregate tables, recommendation examples, and metric charts. Standalone PathSim evaluation saves `pathsim_config.json` and the same evaluation tables and charts in its separate output folder.
 
 ## Tests
 
