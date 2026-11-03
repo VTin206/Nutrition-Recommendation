@@ -1,108 +1,82 @@
-"""Food.com adapter for the official RotatE implementation.
-
-The scoring model and filtered negative-sampling dataset are loaded from the
-vendored, pinned KnowledgeGraphEmbedding source. This module only adapts the
-Food.com user/item ID spaces to the upstream triple interface.
-"""
+"""Food.com adapter around PyKEEN's RotatE implementation."""
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
+import numpy as np
 import torch
 from torch import nn
 
-
-HERE = Path(__file__).resolve().parent
-UPSTREAM_CODES = HERE / "vendor" / "KnowledgeGraphEmbedding" / "codes"
-UPSTREAM_COMMIT = "2e440e0f9c687314d5ff67ead68ce985dc446e3a"
-
-
-def _load_upstream():
-    """Load original modules without shadowing this project's dataloader."""
-    previous_dataloader = sys.modules.pop("dataloader", None)
-    try:
-        loader_spec = importlib.util.spec_from_file_location(
-            "foodcom_rotate_upstream_dataloader", UPSTREAM_CODES / "dataloader.py")
-        loader = importlib.util.module_from_spec(loader_spec)
-        sys.modules[loader_spec.name] = loader
-        loader_spec.loader.exec_module(loader)
-        # The upstream model imports `TestDataset` from a top-level dataloader.
-        sys.modules["dataloader"] = loader
-
-        model_spec = importlib.util.spec_from_file_location(
-            "foodcom_rotate_upstream_model", UPSTREAM_CODES / "model.py")
-        model_module = importlib.util.module_from_spec(model_spec)
-        sys.modules[model_spec.name] = model_module
-        model_spec.loader.exec_module(model_module)
-    finally:
-        sys.modules.pop("dataloader", None)
-        if previous_dataloader is not None:
-            sys.modules["dataloader"] = previous_dataloader
-    return model_module.KGEModel, loader.TrainDataset, loader.BidirectionalOneShotIterator
-
-
-KGEModel, TrainDataset, BidirectionalOneShotIterator = _load_upstream()
+from pykeen.losses import NSSALoss
+from pykeen.models import RotatE
+from pykeen.triples import TriplesFactory
 
 
 class RotatERecommender(nn.Module):
-    """Delegate all RotatE scoring to the original KGEModel implementation."""
+    """Adapt PyKEEN RotatE to score Food.com user/recipe interactions."""
 
-    def __init__(self, nentity: int, nrelation: int, hidden_dim: int, gamma: float,
-                 user_entity_ids, recipe_entity_ids, interacted_relation_id: int):
+    def __init__(self, triples, entity2id, relation2id, embedding_dim: int,
+                 gamma: float, adversarial_temperature: float,
+                 user_entity_ids, recipe_entity_ids, interacted_relation_id: int,
+                 seed: int = 2020):
         super().__init__()
-        if hidden_dim <= 0 or gamma <= 0:
-            raise ValueError("RotatE hidden_dim and gamma must be positive.")
-        if not 0 <= int(interacted_relation_id) < nrelation:
+        if embedding_dim <= 0 or gamma <= 0 or adversarial_temperature <= 0:
+            raise ValueError("embedding_dim, gamma, and adversarial_temperature must be positive.")
+        if not 0 <= int(interacted_relation_id) < len(relation2id):
             raise ValueError("INTERACTED relation ID is outside the relation vocabulary.")
 
-        self.kge = KGEModel(
-            model_name="RotatE",
-            nentity=int(nentity),
-            nrelation=int(nrelation),
-            hidden_dim=int(hidden_dim),
-            gamma=float(gamma),
-            double_entity_embedding=True,
-            double_relation_embedding=False,
+        triples_factory = TriplesFactory(
+            mapped_triples=np.asarray(triples, dtype=np.int64),
+            entity_to_id=entity2id,
+            relation_to_id=relation2id,
+            num_entities=len(entity2id),
+            num_relations=len(relation2id),
         )
-        self.hidden_dim = int(hidden_dim)
+        self.kge = RotatE(
+            triples_factory=triples_factory,
+            embedding_dim=int(embedding_dim),
+            loss=NSSALoss(
+                margin=float(gamma),
+                adversarial_temperature=float(adversarial_temperature),
+            ),
+            random_seed=int(seed),
+        )
+        self.embedding_dim = int(embedding_dim)
         self.gamma = float(gamma)
+        self.adversarial_temperature = float(adversarial_temperature)
         self.interacted_relation_id = int(interacted_relation_id)
-        self.register_buffer("user_entity_ids", torch.as_tensor(user_entity_ids, dtype=torch.long))
-        self.register_buffer("recipe_entity_ids", torch.as_tensor(recipe_entity_ids, dtype=torch.long))
-
-    def forward(self, sample, mode="single"):
-        return self.kge(sample, mode=mode)
+        self.register_buffer(
+            "user_entity_ids", torch.as_tensor(user_entity_ids, dtype=torch.long))
+        self.register_buffer(
+            "recipe_entity_ids", torch.as_tensor(recipe_entity_ids, dtype=torch.long))
 
     def score_triples(self, heads: torch.Tensor, relations: torch.Tensor,
                       tails: torch.Tensor) -> torch.Tensor:
+        """Delegate triple scoring to PyKEEN RotatE."""
         triples = torch.stack((heads, relations, tails), dim=-1)
-        return self.kge(triples).squeeze(-1)
+        return self.kge.score_hrt(triples).squeeze(-1)
 
     def score_pairs(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        """Score aligned user/recipe pairs through INTERACTED triples."""
         users = self.user_entity_ids[user_ids]
         recipes = self.recipe_entity_ids[item_ids]
         relations = torch.full_like(users, self.interacted_relation_id)
         return self.score_triples(users, relations, recipes)
 
     def score_all(self, user_ids: torch.Tensor, item_chunk_size: int = 1024) -> torch.Tensor:
-        """Score each user against every recipe via upstream tail-batch scoring."""
+        """Score each user against every recipe, chunking to bound memory."""
         if item_chunk_size <= 0:
             raise ValueError("item_chunk_size must be positive.")
         users = self.user_entity_ids[user_ids]
         relations = torch.full_like(users, self.interacted_relation_id)
-        positive = torch.stack((users, relations, torch.zeros_like(users)), dim=1)
-        chunks = []
-        for start in range(0, len(self.recipe_entity_ids), item_chunk_size):
-            tails = self.recipe_entity_ids[start:start + item_chunk_size]
-            candidates = tails.unsqueeze(0).expand(len(users), -1).contiguous()
-            chunks.append(self.kge((positive, candidates), mode="tail-batch"))
+        hr_batch = torch.stack((users, relations), dim=-1)
+        chunks = [
+            self.kge.score_t(
+                hr_batch, tails=self.recipe_entity_ids[start:start + item_chunk_size])
+            for start in range(0, len(self.recipe_entity_ids), item_chunk_size)
+        ]
         if not chunks:
             return torch.empty((len(users), 0), device=users.device)
         return torch.cat(chunks, dim=1)
 
-    @staticmethod
-    def post_parameter_update() -> None:
-        """The upstream RotatE implementation applies no post-step projection."""
-        return None
+    def post_parameter_update(self) -> None:
+        """Apply PyKEEN's relation constraint after an optimizer update."""
+        self.kge.post_parameter_update()

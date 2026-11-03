@@ -1,4 +1,4 @@
-"""Food.com experiments with TransE, official RotatE, and PathSim baselines."""
+"""Food.com experiments with PyKEEN TransE, PyKEEN RotatE, and PathSim."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -11,9 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from pykeen.sampling import BasicNegativeSampler
-from torch.utils.data import DataLoader
 from safety_aware import (SafetyStatus, StatusLookup, assess_safety, dcg,
                           experiment_arms, parse_profile_conditions, prepare_metric_reference, safe_ndcg)
 from pathsim_model import PATHSIM_CONFIG, build_pathsim_scores
@@ -22,9 +20,7 @@ HERE = Path(__file__).resolve().parent
 ROOT_DEFAULT = HERE
 from foodcom_data import Dataset, read_split
 from transe_model import TransERecommender
-from rotate_model import (RotatERecommender, TrainDataset as RotateTrainDataset,
-                          BidirectionalOneShotIterator as RotateIterator,
-                          UPSTREAM_COMMIT as ROTATE_UPSTREAM_COMMIT)
+from rotate_model import RotatERecommender
 
 PYKEEN_VERSION = package_version("pykeen")
 # The P=5-only evaluation update does not alter model training or checkpoints.
@@ -33,6 +29,9 @@ PRE_P5_EVALUATION_SOURCE_HASH = "2fe0a7929a6c1fa4b2f46ae28e53c746ded7476d2ed955f
 PRE_K10_EVALUATION_SOURCE_HASH = "a67e721f90d629cd2cd4f33414635ba7939c47a314312d8cf041b448162f7b92"
 # Restricting the reported metrics also changes evaluation output only.
 PRE_SELECTED_METRICS_SOURCE_HASH = "d0ce62b0bc6a10ea407993e052bd47327433f51db2f8a771b763595224c37c35"
+# RotatE's PyKEEN migration leaves existing PyKEEN TransE checkpoints usable.
+PRE_PYKEEN_ROTATE_MIGRATION_SOURCE_HASH = "94b0bf95405283711690fd25b28a831a1f1e77cb8328a67b04361afa03e5bc5e"
+PRE_PYKEEN_ROTATE_ADAPTER_SOURCE_HASH = "856581ba20ba511c584cec318b923eb79af9d528dd176418596f48c0dae97b4b"
 
 USER_METRICS = ["Safety@K", "FillRate@K", "Unsafe@1", "Unknown@K", "P-NDCG@K", "NDCG@K",
                 "Precision@K", "Recall@K"]
@@ -211,14 +210,16 @@ def build_model(kg, embedding, distance="l1", margin=1.0, seed=2020):
         kg["interacted_relation_id"], distance=distance, margin=margin, seed=seed)
 
 
-def build_experiment_model(architecture, kg, embedding, distance, margin, gamma, seed):
+def build_experiment_model(architecture, kg, embedding, distance, margin, gamma,
+                           adversarial_temperature, seed):
     if architecture == "rotate":
         return RotatERecommender(
-            nentity=len(kg["entity2id"]), nrelation=len(kg["relation2id"]),
-            hidden_dim=embedding, gamma=gamma,
+            triples=kg["triples"], entity2id=kg["entity2id"],
+            relation2id=kg["relation2id"], embedding_dim=embedding,
+            gamma=gamma, adversarial_temperature=adversarial_temperature,
             user_entity_ids=kg["user_entity_ids"],
             recipe_entity_ids=kg["recipe_entity_ids"],
-            interacted_relation_id=kg["interacted_relation_id"])
+            interacted_relation_id=kg["interacted_relation_id"], seed=seed)
     if architecture == "transe":
         return build_model(kg, embedding, distance, margin, seed)
     raise ValueError(f"Unsupported KGE architecture: {architecture}")
@@ -275,70 +276,9 @@ def validation_score(model, dataset, val, raw_train, k=10):
 def input_hashes(root, paths):
     sources = [HERE / "foodcom_data.py",
                HERE / "transe_model.py", HERE / "experiment.py", HERE / "safety_aware.py",
-               HERE / "rotate_model.py", HERE / "pathsim_model.py", HERE / "requirements.txt",
-               HERE / "vendor/KnowledgeGraphEmbedding/codes/model.py",
-               HERE / "vendor/KnowledgeGraphEmbedding/codes/dataloader.py",
-               HERE / "vendor/KnowledgeGraphEmbedding/UPSTREAM.md",
-               HERE / "vendor/KnowledgeGraphEmbedding/LICENSE"]
+               HERE / "rotate_model.py", HERE / "pathsim_model.py", HERE / "requirements.txt"]
     return {str(p.relative_to(root)) if p.is_relative_to(root) else str(p): digest(p)
             for p in paths + sources}
-
-
-def make_rotate_training_iterator(kg, batch_size, negative_sample_size):
-    """Use the upstream filtered sampler and alternating head/tail iterator."""
-    triples = [tuple(map(int, row)) for row in kg["triples"]]
-    common = dict(batch_size=batch_size, shuffle=True, num_workers=0,
-                  collate_fn=RotateTrainDataset.collate_fn)
-    head_loader = DataLoader(
-        RotateTrainDataset(triples, len(kg["entity2id"]), len(kg["relation2id"]),
-                           negative_sample_size, "head-batch"), **common)
-    tail_loader = DataLoader(
-        RotateTrainDataset(triples, len(kg["entity2id"]), len(kg["relation2id"]),
-                           negative_sample_size, "tail-batch"), **common)
-    return RotateIterator(head_loader, tail_loader), 2 * max(len(head_loader), len(tail_loader))
-
-
-def official_rotate_constrained_step(model, optimizer, iterator, safety_users,
-                                     safe_pool, unsafe_pool, weight, margin,
-                                     temperature, rng, device):
-    """Official RotatE objective plus the experiment's M2 safety hinge term."""
-    model.train()
-    positive, negative, subsampling_weight, mode = next(iterator)
-    positive = positive.to(device)
-    negative = negative.to(device)
-    subsampling_weight = subsampling_weight.to(device)
-    optimizer.zero_grad(set_to_none=True)
-
-    negative_scores = model((positive, negative), mode=mode)
-    negative_log = (
-        F.softmax(negative_scores * temperature, dim=1).detach()
-        * F.logsigmoid(-negative_scores)
-    ).sum(dim=1)
-    positive_log = F.logsigmoid(model(positive)).squeeze(1)
-    positive_loss = -(subsampling_weight * positive_log).sum() / subsampling_weight.sum()
-    negative_loss = -(subsampling_weight * negative_log).sum() / subsampling_weight.sum()
-    kg_loss = (positive_loss + negative_loss) / 2
-
-    count = len(positive)
-    sampled_users = rng.choice(safety_users, size=count, replace=True)
-    sampled_safe = np.asarray([rng.choice(safe_pool[int(user)]) for user in sampled_users],
-                              dtype=np.int64)
-    sampled_unsafe = np.asarray([rng.choice(unsafe_pool[int(user)]) for user in sampled_users],
-                                dtype=np.int64)
-    sampled_users = torch.as_tensor(sampled_users, dtype=torch.long, device=device)
-    sampled_safe = torch.as_tensor(sampled_safe, dtype=torch.long, device=device)
-    sampled_unsafe = torch.as_tensor(sampled_unsafe, dtype=torch.long, device=device)
-    safe_scores = model.score_pairs(sampled_users, sampled_safe)
-    unsafe_scores = model.score_pairs(sampled_users, sampled_unsafe)
-    safety_loss = torch.relu(margin + unsafe_scores - safe_scores).mean()
-    total_loss = kg_loss + weight * safety_loss
-    if not torch.isfinite(total_loss):
-        raise ValueError("Non-finite RotatE loss; stopping training.")
-    total_loss.backward()
-    optimizer.step()
-    return {"kge_loss": float(kg_loss.detach()),
-            "safety_loss": float(safety_loss.detach()),
-            "total_loss": float(total_loss.detach()), "count": count}
 
 def train(args):
     (root, metadata, rules, _, _, raw_train, val, _, paths, kg) = load_inputs(args.root)
@@ -361,29 +301,28 @@ def train(args):
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     rotate = args.architecture == "rotate"
-    architecture_label = "RotatE (official KnowledgeGraphEmbedding)" if rotate else "PyKEEN TransE"
-    base_objective = ("Official KGEModel log-sigmoid objective with self-adversarial negatives"
+    architecture_label = "PyKEEN RotatE" if rotate else "PyKEEN TransE"
+    base_objective = ("PyKEEN NSSALoss (self-adversarial negative sampling)"
                       if rotate else "PyKEEN MarginRankingLoss with sLCWA negatives")
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "architecture_id": args.architecture,
         "architecture": architecture_label,
-        "implementation": ("vendor/KnowledgeGraphEmbedding/codes/model.py::KGEModel"
-                           if rotate else "pykeen.models.TransE"),
-        "upstream_repository": ("https://github.com/DeepGraphLearning/KnowledgeGraphEmbedding"
-                                if rotate else "https://pykeen.readthedocs.io/"),
-        "upstream_commit": ROTATE_UPSTREAM_COMMIT if rotate else None,
-        "pykeen_version": None if rotate else PYKEEN_VERSION,
+        "implementation": "pykeen.models.RotatE" if rotate else "pykeen.models.TransE",
+        "implementation_source": ("https://pykeen.readthedocs.io/en/stable/api/pykeen.models.RotatE.html"
+                                  if rotate else "https://pykeen.readthedocs.io/en/stable/api/pykeen.models.TransE.html"),
+        "pykeen_version": PYKEEN_VERSION,
+        "loss_implementation": ("pykeen.losses.NSSALoss" if rotate
+                                else "pykeen.losses.MarginRankingLoss"),
+        "optimizer": "Adam" if rotate else "SGD",
         "training_objective": base_objective,
-        "negative_sampler": ("Official TrainDataset filtered head/tail corruption with alternating iterator"
-                             if rotate else "PyKEEN BasicNegativeSampler (filtered, head/tail)"),
+        "negative_sampler": "PyKEEN BasicNegativeSampler (filtered, head/tail corruption)",
         "health_condition": conditions,
         "distance": None if rotate else args.distance,
         "margin": None if rotate else args.margin,
         "embedding": args.embedding,
         "gamma": args.gamma if rotate else None,
         "negative_sample_size": args.negative_sample_size if rotate else None,
-        "negative_adversarial_sampling": rotate,
         "adversarial_temperature": args.adversarial_temperature if rotate else None,
         "entity_count": len(kg["entity2id"]),
         "relation_count": len(kg["relation2id"]),
@@ -409,111 +348,83 @@ def train(args):
     (out / "training_config.json").write_text(json.dumps(model_config, indent=2), encoding="utf-8")
     model = build_experiment_model(
         args.architecture, kg, args.embedding, args.distance, args.margin,
-        args.gamma, args.seed).to(device)
+        args.gamma, args.adversarial_temperature, args.seed).to(device)
     if rotate:
         optimizer = torch.optim.Adam(model.kge.parameters(), lr=args.learning_rate)
-        rotate_iterator, rotate_steps = make_rotate_training_iterator(
-            kg, args.batch_size, args.negative_sample_size)
-        official_args = argparse.Namespace(
-            cuda=device.type == "cuda", negative_adversarial_sampling=True,
-            adversarial_temperature=args.adversarial_temperature,
-            uni_weight=False, regularization=0.0)
-        triple_sampler = None
+        negative_sample_size = args.negative_sample_size
     else:
         optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate)
-        rotate_iterator, rotate_steps, official_args = None, 0, None
-        triple_sampler = BasicNegativeSampler(
-            mapped_triples=torch.as_tensor(kg["triples"], dtype=torch.long),
-            num_entities=len(kg["entity2id"]),
-            num_relations=len(kg["relation2id"]),
-            num_negs_per_pos=1,
-            filtered=True,
-            corruption_scheme=("head", "tail"),
-        ).to(device)
+        negative_sample_size = 1
+    triple_sampler = BasicNegativeSampler(
+        mapped_triples=torch.as_tensor(kg["triples"], dtype=torch.long),
+        num_entities=len(kg["entity2id"]),
+        num_relations=len(kg["relation2id"]),
+        num_negs_per_pos=negative_sample_size,
+        filtered=True,
+        corruption_scheme=("head", "tail"),
+    ).to(device)
     rng = np.random.default_rng(args.seed)
     safety_rng = np.random.default_rng(args.seed + 1)
     history, best, best_epoch, stale = [], -float("inf"), 0, 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         sums, count, safety_count = {"kge_loss": 0., "safety_loss": 0., "total_loss": 0.}, 0, 0
-        if rotate:
-            for _ in range(rotate_steps):
-                if args.model == "m1":
-                    log = model.kge.train_step(model.kge, optimizer, rotate_iterator, official_args)
-                    kg_loss = float(log["loss"])
-                    safety_loss = 0.0
-                    total_loss = kg_loss
-                else:
-                    log = official_rotate_constrained_step(
-                        model, optimizer, rotate_iterator, safety_users,
-                        safe_positive, unsafe, args.lambda_safe, args.delta,
-                        args.adversarial_temperature, safety_rng, device)
-                    kg_loss, safety_loss, total_loss = (
-                        log["kge_loss"], log["safety_loss"], log["total_loss"])
-                model.post_parameter_update()
-                sums["kge_loss"] += kg_loss
-                sums["safety_loss"] += safety_loss
-                sums["total_loss"] += total_loss
-                count += 1
-                if args.model == "m2":
-                    safety_count += 1
-        else:
-            order = rng.permutation(len(kg["triples"]))
-            for start in range(0, len(order), args.batch_size):
-                indices = order[start:start + args.batch_size]
-                batch = kg["triples"][indices]
-                as_tensor = lambda x: torch.as_tensor(x, dtype=torch.long, device=device)
-                positive_tensor = as_tensor(batch)
-                negative_tensor, valid_negative_mask = triple_sampler.sample(positive_tensor)
-                negative_tensor = negative_tensor.to(device)
-                positive_scores = model.score_triples(*positive_tensor.unbind(dim=1)).unsqueeze(-1)
-                if valid_negative_mask is None:
-                    negative_scores = model.score_triples(
-                        *negative_tensor.reshape(-1, 3).unbind(dim=1)
-                    ).reshape(len(batch), -1)
-                    kg_loss = model.kge.loss.process_slcwa_scores(
-                        positive_scores=positive_scores, negative_scores=negative_scores)
-                else:
-                    valid_negative_mask = valid_negative_mask.to(device)
-                    if not valid_negative_mask.any():
-                        continue
-                    negative_tensor = negative_tensor[valid_negative_mask]
-                    negative_scores = model.score_triples(
-                        *negative_tensor.unbind(dim=1))
-                    kg_loss = model.kge.loss.process_slcwa_scores(
-                        positive_scores=positive_scores,
-                        negative_scores=negative_scores,
-                        batch_filter=valid_negative_mask,
-                    )
-                safe_loss = torch.zeros((), device=device)
-                safety_pairs = 0
-                if args.model == "m2":
-                    safety_batch_users = safety_rng.choice(
-                        safety_users, size=len(batch), replace=True)
-                    safe_items = np.asarray([
-                        safety_rng.choice(safe_positive[int(user)]) for user in safety_batch_users
-                    ], dtype=np.int64)
-                    unsafe_items = np.asarray([
-                        safety_rng.choice(unsafe[int(user)]) for user in safety_batch_users
-                    ], dtype=np.int64)
-                    user_tensor = as_tensor(safety_batch_users)
-                    safe_scores = pair_scores(model, user_tensor, as_tensor(safe_items))
-                    unsafe_scores = pair_scores(model, user_tensor, as_tensor(unsafe_items))
-                    safe_loss = torch.relu(args.delta + unsafe_scores - safe_scores).mean()
-                    safety_pairs = len(batch)
-                total = kg_loss + args.lambda_safe * safe_loss if args.model == "m2" else kg_loss
-                if not torch.isfinite(total):
-                    raise ValueError("Non-finite loss; stopping training.")
-                optimizer.zero_grad(set_to_none=True)
-                total.backward()
-                optimizer.step()
-                model.post_parameter_update()
-                n = len(batch)
-                sums["kge_loss"] += float(kg_loss.detach()) * n
-                sums["safety_loss"] += float(safe_loss.detach()) * safety_pairs
-                safety_count += safety_pairs
-                sums["total_loss"] += float(total.detach()) * n
-                count += n
+        order = rng.permutation(len(kg["triples"]))
+        for start in range(0, len(order), args.batch_size):
+            indices = order[start:start + args.batch_size]
+            batch = kg["triples"][indices]
+            as_tensor = lambda x: torch.as_tensor(x, dtype=torch.long, device=device)
+            positive_tensor = as_tensor(batch)
+            negative_tensor, valid_negative_mask = triple_sampler.sample(positive_tensor)
+            negative_tensor = negative_tensor.to(device)
+            positive_scores = model.score_triples(*positive_tensor.unbind(dim=1)).unsqueeze(-1)
+            if valid_negative_mask is None:
+                negative_scores = model.score_triples(
+                    *negative_tensor.reshape(-1, 3).unbind(dim=1)
+                ).reshape(len(batch), -1)
+                kg_loss = model.kge.loss.process_slcwa_scores(
+                    positive_scores=positive_scores, negative_scores=negative_scores)
+            else:
+                valid_negative_mask = valid_negative_mask.to(device)
+                if not valid_negative_mask.any():
+                    continue
+                negative_tensor = negative_tensor[valid_negative_mask]
+                negative_scores = model.score_triples(
+                    *negative_tensor.unbind(dim=1))
+                kg_loss = model.kge.loss.process_slcwa_scores(
+                    positive_scores=positive_scores,
+                    negative_scores=negative_scores,
+                    batch_filter=valid_negative_mask,
+                )
+            safe_loss = torch.zeros((), device=device)
+            safety_pairs = 0
+            if args.model == "m2":
+                safety_batch_users = safety_rng.choice(
+                    safety_users, size=len(batch), replace=True)
+                safe_items = np.asarray([
+                    safety_rng.choice(safe_positive[int(user)]) for user in safety_batch_users
+                ], dtype=np.int64)
+                unsafe_items = np.asarray([
+                    safety_rng.choice(unsafe[int(user)]) for user in safety_batch_users
+                ], dtype=np.int64)
+                user_tensor = as_tensor(safety_batch_users)
+                safe_scores = pair_scores(model, user_tensor, as_tensor(safe_items))
+                unsafe_scores = pair_scores(model, user_tensor, as_tensor(unsafe_items))
+                safe_loss = torch.relu(args.delta + unsafe_scores - safe_scores).mean()
+                safety_pairs = len(batch)
+            total = kg_loss + args.lambda_safe * safe_loss if args.model == "m2" else kg_loss
+            if not torch.isfinite(total):
+                raise ValueError("Non-finite loss; stopping training.")
+            optimizer.zero_grad(set_to_none=True)
+            total.backward()
+            optimizer.step()
+            model.post_parameter_update()
+            n = len(batch)
+            sums["kge_loss"] += float(kg_loss.detach()) * n
+            sums["safety_loss"] += float(safe_loss.detach()) * safety_pairs
+            safety_count += safety_pairs
+            sums["total_loss"] += float(total.detach()) * n
+            count += n
         if count == 0:
             raise ValueError("No training batches were processed in this epoch.")
         row = {"epoch": epoch, "kge_loss": sums["kge_loss"] / count,
@@ -544,8 +455,7 @@ def train(args):
         "kg_triples": int(len(kg["triples"])),
         "training_users_with_safety_pairs": int(len(safety_users)), "device": str(device),
         "architecture": architecture_label,
-        "upstream_commit": ROTATE_UPSTREAM_COMMIT if rotate else None,
-        "pykeen_version": None if rotate else PYKEEN_VERSION,
+        "pykeen_version": PYKEEN_VERSION,
         "training_objective": model_config["training_objective"]}, indent=2),
         encoding="utf-8")
     print(f"Saved {args.model.upper()} checkpoint at epoch {best_epoch}: {out}")
@@ -595,6 +505,17 @@ def evaluate(args):
         if not manifest_path.is_file():
             raise FileNotFoundError(f"Missing experiment manifest: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        architecture = manifest.get("architecture_id", "transe")
+        if architecture == "rotate" and manifest.get("implementation") != "pykeen.models.RotatE":
+            raise ValueError(
+                "This RotatE checkpoint uses the previous implementation. "
+                "Train fresh PyKEEN RotatE checkpoints in a new run folder."
+            )
+        if architecture in {"transe", "rotate"} and manifest.get("pykeen_version") != PYKEEN_VERSION:
+            raise ValueError(
+                f"Checkpoint was trained with PyKEEN {manifest.get('pykeen_version')}; "
+                f"the current runtime has {PYKEEN_VERSION}. Install the pinned requirements."
+            )
         expected_hashes = manifest["input_sha256"]
         current_hashes = input_hashes(root, paths)
         changed_hashes = [name for name in set(expected_hashes) | set(current_hashes)
@@ -607,21 +528,25 @@ def evaluate(args):
                 PRE_SELECTED_METRICS_SOURCE_HASH,
             }
         )
-        if changed_hashes and not evaluation_only_code_change:
+        legacy_transe_compatible = (
+            architecture == "transe"
+            and expected_hashes.get("experiment.py") == PRE_PYKEEN_ROTATE_MIGRATION_SOURCE_HASH
+            and expected_hashes.get("rotate_model.py") == PRE_PYKEEN_ROTATE_ADAPTER_SOURCE_HASH
+            and set(changed_hashes).issubset({
+                "experiment.py", "rotate_model.py",
+                "vendor/KnowledgeGraphEmbedding/LICENSE",
+                "vendor/KnowledgeGraphEmbedding/UPSTREAM.md",
+                "vendor/KnowledgeGraphEmbedding/codes/dataloader.py",
+                "vendor/KnowledgeGraphEmbedding/codes/model.py",
+            })
+        )
+        if changed_hashes and not (evaluation_only_code_change or legacy_transe_compatible):
             raise ValueError(
                 "Evaluation data/code/dependency hashes differ from training. "
                 "Train fresh checkpoints in a new run folder with the current implementation."
             )
         if manifest.get("health_condition") != conditions:
             raise ValueError("Evaluation health condition differs from training. Use the same --health-condition.")
-        architecture = manifest.get("architecture_id", "transe")
-        if architecture == "transe" and manifest.get("pykeen_version") != PYKEEN_VERSION:
-            raise ValueError(
-                f"Checkpoint was trained with PyKEEN {manifest.get('pykeen_version')}; "
-                f"the current runtime has {PYKEEN_VERSION}. Install the pinned requirements."
-            )
-        if architecture == "rotate" and manifest.get("upstream_commit") != ROTATE_UPSTREAM_COMMIT:
-            raise ValueError("Checkpoint RotatE source commit differs from this package's pinned upstream source.")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = Dataset(root / "interactions/foodcom_train.txt", len(metadata), device)
     dataset.validate_heldout(test)
@@ -673,7 +598,8 @@ def evaluate(args):
                                         map_location=device, weights_only=False)
                 model = build_experiment_model(
                     architecture, kg, manifest["embedding"], manifest.get("distance") or "l1",
-                    manifest["margin"], manifest.get("gamma") or 12.0,
+                    manifest.get("margin") or 1.0, manifest.get("gamma") or 12.0,
+                    manifest.get("adversarial_temperature") or 1.0,
                     manifest["seed"]).to(device)
                 model.load_state_dict(checkpoint["state_dict"])
                 score_cache[model_name] = score_model(model, dataset)
@@ -801,23 +727,23 @@ def main():
         p.add_argument("--health-condition", required=True,
                        help="One condition or a '|' separated combination; e.g. hypertension or diabetes|hypertension or comorbidity")
         p.add_argument("--architecture", choices=("transe", "rotate"), default="transe",
-                       help="KGE architecture: PyKEEN TransE or RotatE from the vendored original repository")
+                       help="KGE architecture: PyKEEN TransE or PyKEEN RotatE")
         p.add_argument("--seed", type=int, default=2020)
         p.add_argument("--embedding", type=int, default=64,
-                       help="TransE embedding dimension; RotatE upstream hidden dimension (entity vectors are twice this size)")
+                       help="TransE or complex-valued RotatE embedding dimension")
         p.add_argument("--distance", choices=("l1", "l2"), default="l1")
         p.add_argument("--margin", type=float, default=1.0)
         p.add_argument("--gamma", type=float, default=12.0,
-                       help="RotatE upstream gamma parameter")
+                       help="RotatE NSSALoss margin (gamma)")
         p.add_argument("--negative-sample-size", type=int, default=128,
-                       help="RotatE upstream filtered negatives per positive triple")
+                       help="Filtered PyKEEN RotatE negatives per positive triple")
         p.add_argument("--adversarial-temperature", type=float, default=1.0,
-                       help="RotatE upstream self-adversarial sampling temperature")
+                       help="RotatE PyKEEN NSSALoss adversarial temperature")
         p.add_argument("--epochs", type=int, default=300)
         p.add_argument("--patience", type=int, default=20)
         p.add_argument("--batch-size", type=int, default=1024)
         p.add_argument("--learning-rate", type=float, default=None,
-                       help="Defaults to 0.001 for TransE and the original RotatE default 0.0001")
+                       help="Defaults to 0.001 for TransE and 0.0001 for RotatE")
         p.add_argument("--device", default=None)
     tr = subs.add_parser("train")
     shared(tr)

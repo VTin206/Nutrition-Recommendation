@@ -48,13 +48,13 @@ The same selected health scenario and validation checkpoint-selection metric are
 
 Because PyKEEN changes the model implementation and checkpoint format, train both models again in a new run folder. Checkpoints made by the previous hand-coded TransE implementation cannot be loaded by this version.
 
-## RotatE from the original repository
+## RotatE with PyKEEN
 
-RotatE is loaded from the original [KnowledgeGraphEmbedding repository](https://github.com/DeepGraphLearning/KnowledgeGraphEmbedding), pinned to commit `2e440e0f9c687314d5ff67ead68ce985dc446e3a`. The original `KGEModel`, `TrainDataset`, and `BidirectionalOneShotIterator` files are bundled under `vendor/KnowledgeGraphEmbedding/` with their MIT license. The adapter only maps Food.com users and recipes to KG triples; it does not reimplement RotatE scoring. The bundled source matches the original repository at the pinned commit.
+RotatE uses PyKEEN 1.11.1's [`pykeen.models.RotatE`](https://pykeen.readthedocs.io/en/stable/api/pykeen.models.RotatE.html), with no locally implemented RotatE scoring function or vendored upstream source. The adapter only maps Food.com users and recipes to the project's KG IDs and calls PyKEEN scoring methods. `--embedding 64` is the dimension of the complex-valued embedding.
 
-RotatE M1 uses the original model's `train_step`, including its log-sigmoid objective, filtered head/tail negative sampling, frequency subsampling, and self-adversarial negative weights. RotatE M2 uses the same original RotatE model and sampler, then adds the project safety hinge loss in the same optimizer step. The adapter's `--embedding` value is the original `hidden_dim`; the upstream model doubles entity embedding width internally for complex-valued entities. Defaults are gamma 12, 128 negatives, adversarial temperature 1, Adam, and learning rate 0.0001. The safety loss and inference-time hard filter are project-specific additions.
+RotatE M1 uses PyKEEN's [`NSSALoss`](https://pykeen.readthedocs.io/en/stable/api/pykeen.losses.NSSALoss.html) and filtered [`BasicNegativeSampler`](https://pykeen.readthedocs.io/en/stable/api/pykeen.sampling.BasicNegativeSampler.html); M2 uses those same KGE components and adds the project's safety hinge loss in the optimizer step. `--gamma` is passed as the NSSA margin, `--negative-sample-size` is the number of filtered negatives per positive triple, and `--adversarial-temperature` controls the NSSA weights. Defaults are gamma 12, 128 negatives, temperature 1, Adam, and learning rate 0.0001. The project owns the training loop, safety loss, validation checkpoint selection, and inference-time hard filter; PyKEEN supplies the RotatE model, NSSA loss, and negative sampler. The prior vendored training iterator and its frequency-based subsampling are no longer used.
 
-Train M1 and M2 with the same architecture and run folder. Use a separate new folder for RotatE and retrain both arms; TransE and RotatE checkpoints are not interchangeable. Compare M1 against M2 within the same architecture. A direct TransE-versus-RotatE comparison also changes the base training objective and sampler, so report the architecture and training configuration.
+This implementation change makes earlier RotatE checkpoints incompatible. Train fresh M1 and M2 checkpoints in a new run folder. Compare M1 against M2 within the same architecture, and report each architecture's recorded PyKEEN version and training configuration. TransE and RotatE use different KGE objectives and negative-sample counts here, so a direct cross-architecture comparison changes more than the scoring model; report the full configurations and avoid attributing the difference to architecture alone.
 
 ## PathSim baselines
 
@@ -100,7 +100,7 @@ Install the dependencies from the cloned repository:
 !pip install -q -r "$ROOT/requirements.txt"
 ```
 
-The Colab runtime must use Python 3.11 or newer for the pinned PyKEEN version. RotatE source is included in this folder, so Colab does not need to clone another repository at runtime.
+The Colab runtime must use Python 3.11 or newer for the pinned PyKEEN version. Install PyKEEN from this folder's `requirements.txt`; no separate RotatE repository is needed.
 
 Train M1 and M2 separately with the same `HEALTH_CONDITION` and `RUN` path:
 
