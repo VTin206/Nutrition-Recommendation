@@ -29,6 +29,9 @@ PRE_P5_EVALUATION_SOURCE_HASH = "2fe0a7929a6c1fa4b2f46ae28e53c746ded7476d2ed955f
 PRE_K10_EVALUATION_SOURCE_HASH = "a67e721f90d629cd2cd4f33414635ba7939c47a314312d8cf041b448162f7b92"
 # Restricting the reported metrics also changes evaluation output only.
 PRE_SELECTED_METRICS_SOURCE_HASH = "d0ce62b0bc6a10ea407993e052bd47327433f51db2f8a771b763595224c37c35"
+# Adding the M1 + SAFE-filter evaluation arm changes reporting only; training is unchanged.
+PRE_M1_FILTER_EVALUATION_SOURCE_HASH = "43f522f8ce02a8f25154d61acc28e3a6df59ada713825581b449ef366909882d"
+PRE_M1_FILTER_SAFETY_SOURCE_HASH = "d52df82e51c1cc9d884cdea1beaccea6b4ed7bb78873f09e6aa55c1734855796"
 # RotatE's PyKEEN migration leaves existing PyKEEN TransE checkpoints usable.
 PRE_PYKEEN_ROTATE_MIGRATION_SOURCE_HASH = "94b0bf95405283711690fd25b28a831a1f1e77cb8328a67b04361afa03e5bc5e"
 PRE_PYKEEN_ROTATE_ADAPTER_SOURCE_HASH = "856581ba20ba511c584cec318b923eb79af9d528dd176418596f48c0dae97b4b"
@@ -521,12 +524,18 @@ def evaluate(args):
         changed_hashes = [name for name in set(expected_hashes) | set(current_hashes)
                           if expected_hashes.get(name) != current_hashes.get(name)]
         evaluation_only_code_change = (
-            set(changed_hashes) == {"experiment.py"} and
-            expected_hashes.get("experiment.py") in {
-                PRE_P5_EVALUATION_SOURCE_HASH,
-                PRE_K10_EVALUATION_SOURCE_HASH,
-                PRE_SELECTED_METRICS_SOURCE_HASH,
-            }
+            (
+                set(changed_hashes) == {"experiment.py"} and
+                expected_hashes.get("experiment.py") in {
+                    PRE_P5_EVALUATION_SOURCE_HASH,
+                    PRE_K10_EVALUATION_SOURCE_HASH,
+                    PRE_SELECTED_METRICS_SOURCE_HASH,
+                }
+            ) or (
+                set(changed_hashes) == {"experiment.py", "safety_aware.py"} and
+                expected_hashes.get("experiment.py") == PRE_M1_FILTER_EVALUATION_SOURCE_HASH and
+                expected_hashes.get("safety_aware.py") == PRE_M1_FILTER_SAFETY_SOURCE_HASH
+            )
         )
         legacy_transe_compatible = (
             architecture == "transe"
