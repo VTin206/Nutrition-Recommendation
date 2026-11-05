@@ -579,12 +579,13 @@ def evaluate(args):
         reference = prepare_metric_reference(relevance.get(user, {}), lookup, candidates)
         contexts[user] = (states, candidates, lookup, reference)
     example_users = set(range(min(n_users, 200)))
-    examples, rows, score_cache = [], [], {}
+    examples, rows, score_cache, best_epochs = [], [], {}, {}
     for label, model_name, hard_filter in arms:
         if model_name not in score_cache:
             if model_name.startswith("pathsim_"):
                 pathsim_scores, pathsim_data_counts = build_pathsim_scores(dataset, kg)
                 score_cache.update(pathsim_scores)
+                best_epochs[model_name] = None
                 pathsim_config = {
                     **PATHSIM_CONFIG,
                     "health_condition": conditions,
@@ -596,6 +597,12 @@ def evaluate(args):
             else:
                 checkpoint = torch.load(run_dir / model_name / "best_checkpoint.pt",
                                         map_location=device, weights_only=False)
+                summary_path = run_dir / model_name / "training_summary.json"
+                best_epochs[model_name] = checkpoint.get("epoch")
+                if summary_path.is_file():
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    best_epochs[model_name] = summary.get(
+                        "best_epoch", best_epochs[model_name])
                 model = build_experiment_model(
                     architecture, kg, manifest["embedding"], manifest.get("distance") or "l1",
                     manifest.get("margin") or 1.0, manifest.get("gamma") or 12.0,
@@ -647,6 +654,7 @@ def evaluate(args):
                         "user_id", "K", "penalty_P", *USER_METRICS]
     pd.DataFrame(rows)[per_user_columns].to_csv(run_dir / "per_user_metrics.csv", index=False)
     table = aggregate_rows(rows)
+    table["best_epoch"] = table["model"].map(best_epochs)
     table.to_csv(run_dir / "model_comparison.csv", index=False)
     pd.DataFrame(examples).to_csv(run_dir / "recommendation_examples.csv", index=False)
     comparison_examples(rows, run_dir)
